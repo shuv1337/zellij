@@ -2610,14 +2610,21 @@ impl Screen {
         if matches!(pane_id, PaneId::Plugin(_)) {
             return;
         }
-        // Phase 1e "any client" aggregate: answer OK if any connected client's
-        // outer terminal can render Kitty (render output is already per-client
-        // gated, so one supporting client is enough; others get a placeholder).
-        // v1 uses the global any-client aggregate; a per-tab refinement
-        // ("clients viewing this pane's tab") can tighten it later.
-        let supported = self.any_client_supports_kitty();
-        let reply = if supported {
-            query.ok_reply().unwrap_or_default()
+        // Phase 1e "any client" aggregate: only consider answering if any
+        // connected client's outer terminal can render Kitty (render output is
+        // already per-client gated, so one supporting client is enough; others
+        // get a placeholder). v1 uses the global any-client aggregate; a
+        // per-tab refinement ("clients viewing this pane's tab") can tighten it
+        // later.
+        //
+        // The reply itself is medium-aware: apps such as `icat` probe each
+        // transmission medium (direct / temp-file / shared-memory) with its own
+        // `a=q`, then transmit via whichever we answer `OK` for. v1 only ingests
+        // direct (`t=d`) payloads, so `KittyQuery::reply` answers `OK` to direct
+        // probes and `EBADT` to file/shared-memory probes — making the app fall
+        // back to direct streaming instead of a medium we would silently drop.
+        let reply = if self.any_client_supports_kitty() {
+            query.reply().unwrap_or_default()
         } else {
             Vec::new()
         };

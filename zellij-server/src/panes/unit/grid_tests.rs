@@ -6122,6 +6122,7 @@ fn kitty_a_q_pushes_kitty_graphics_query_to_forwarded_queries() {
             id: Some(31),
             image_number: None,
             quiet: 0,
+            medium: crate::panes::kitty::KittyMedium::Direct,
         })],
         "Kitty a=q must enrol HostQuery::KittyGraphics for Screen to short-circuit"
     );

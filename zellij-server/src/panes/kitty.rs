@@ -48,8 +48,9 @@ pub enum KittyDelete {
     Unsupported,
 }
 
-/// A Kitty support query (`a=q`). Carries only what is needed to synthesize the
-/// reply (`ESC _ G i=<id>[,I=<number>] ; OK ST`) and honour quiet mode.
+/// A Kitty support query (`a=q`). Carries what is needed to synthesize the
+/// reply (`ESC _ G i=<id>[,I=<number>] ; OK|<err> ST`), honour quiet mode, and
+/// answer per the probed transmission medium.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KittyQuery {
     /// `i=` image id chosen by the app (the probe echoes this back).
@@ -58,6 +59,12 @@ pub struct KittyQuery {
     pub image_number: Option<u32>,
     /// `q=` quiet level: `1` suppresses OK replies, `2` also suppresses errors.
     pub quiet: u8,
+    /// `t=` transmission medium being probed. Apps like `icat` send one `a=q`
+    /// per medium (direct, temp-file, shared-memory) and pick the "best"
+    /// medium we answer `OK` for. v1 only ingests direct (`t=d`) payloads, so we
+    /// must answer an *error* to file/shared-memory probes — otherwise the app
+    /// transmits via a medium we silently drop and no image appears.
+    pub medium: KittyMedium,
 }
 
 /// One transmit/display/place command chunk: its typed control plus the
@@ -98,10 +105,11 @@ pub enum KittyFormat {
 }
 
 /// Transmission medium (`t=`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KittyMedium {
-    /// `t=d` — direct: base64 payload inline. The default, and the only medium
-    /// supported in v1.
+    /// `t=d` — direct: base64 payload inline. The Kitty default, and the only
+    /// medium supported in v1.
+    #[default]
     Direct,
     /// `t=f` — a regular file path.
     File,
@@ -145,12 +153,32 @@ impl KittyControl {
 }
 
 impl KittyQuery {
-    /// The `OK` reply for this query, or `None` if quiet mode suppresses it.
-    /// Caller decides *whether* to answer OK (capability gating, Phase 1e); this
+    /// Whether v1 can ingest a transmission on the medium this query probes.
+    /// Only direct (`t=d`) inline payloads are supported; we must NOT answer
+    /// `OK` to file/temp-file/shared-memory probes (the app would then choose
+    /// that medium and we would drop the image).
+    pub fn medium_supported(&self) -> bool {
+        matches!(self.medium, KittyMedium::Direct)
+    }
+
+    /// The reply for this query, or `None` if quiet mode suppresses it.
+    ///
+    /// - Direct (`t=d`) probe → `i=<id>[,I=<n>];OK` (we can render it).
+    /// - File / shared-memory probe → `i=<id>[,I=<n>];EBADT` so the app falls
+    ///   back to a medium we support (direct streaming). `EBADT` is Kitty's
+    ///   "bad transmission medium" error code.
+    ///
+    /// Quiet handling per the spec: `q=1` suppresses only `OK`; `q=2`
+    /// suppresses errors too. So an error reply is still emitted at `q=1`.
+    /// The caller decides *whether* to answer at all (capability gating); this
     /// only builds the bytes.
-    pub fn ok_reply(&self) -> Option<Vec<u8>> {
-        if self.quiet >= 1 {
-            // q=1 (and q=2) suppress OK responses.
+    pub fn reply(&self) -> Option<Vec<u8>> {
+        let supported = self.medium_supported();
+        // Quiet gating: q>=1 hides OK; q>=2 also hides errors.
+        if supported && self.quiet >= 1 {
+            return None;
+        }
+        if !supported && self.quiet >= 2 {
             return None;
         }
         let mut keys = String::new();
@@ -163,7 +191,8 @@ impl KittyQuery {
             }
             keys.push_str(&format!("I={}", number));
         }
-        Some(format!("\x1b_G{};OK\x1b\\", keys).into_bytes())
+        let status = if supported { "OK" } else { "EBADT" };
+        Some(format!("\x1b_G{};{}\x1b\\", keys, status).into_bytes())
     }
 }
 
@@ -182,6 +211,7 @@ pub fn dispatch(body: &[u8]) -> KittyOutcome {
             id: control.image_id,
             image_number: control.image_number,
             quiet: control.quiet,
+            medium: control.medium,
         }),
         KittyAction::Transmit | KittyAction::TransmitAndDisplay | KittyAction::Place => {
             KittyOutcome::Store(KittyCommand { control, payload })
@@ -888,6 +918,7 @@ mod tests {
                 id: Some(31),
                 image_number: None,
                 quiet: 0,
+                medium: KittyMedium::Direct,
             })
         );
     }
@@ -901,6 +932,43 @@ mod tests {
                 id: None,
                 image_number: Some(7),
                 quiet: 2,
+                medium: KittyMedium::Direct,
+            })
+        );
+    }
+
+    #[test]
+    fn query_carries_probed_medium() {
+        // icat probes each medium with its own a=q; we must capture t= so the
+        // reply can answer OK only for media we actually ingest.
+        let direct = dispatch(b"a=q,f=24,s=1,v=1,i=1");
+        let tempfile = dispatch(b"a=q,f=24,t=t,s=1,v=1,i=2");
+        let shmem = dispatch(b"a=q,f=24,t=s,s=1,v=1,i=3");
+        assert_eq!(
+            direct,
+            KittyOutcome::Query(KittyQuery {
+                id: Some(1),
+                image_number: None,
+                quiet: 0,
+                medium: KittyMedium::Direct,
+            })
+        );
+        assert_eq!(
+            tempfile,
+            KittyOutcome::Query(KittyQuery {
+                id: Some(2),
+                image_number: None,
+                quiet: 0,
+                medium: KittyMedium::TempFile,
+            })
+        );
+        assert_eq!(
+            shmem,
+            KittyOutcome::Query(KittyQuery {
+                id: Some(3),
+                image_number: None,
+                quiet: 0,
+                medium: KittyMedium::SharedMemory,
             })
         );
     }
@@ -949,20 +1017,48 @@ mod tests {
                 id: Some(5),
                 image_number: None,
                 quiet: 0,
+                medium: KittyMedium::Direct,
             })
         );
     }
 
     #[test]
-    fn ok_reply_echoes_id_and_honours_quiet() {
-        let q = KittyQuery { id: Some(31), image_number: None, quiet: 0 };
-        assert_eq!(q.ok_reply(), Some(b"\x1b_Gi=31;OK\x1b\\".to_vec()));
+    fn reply_echoes_id_and_honours_quiet() {
+        let q = KittyQuery { id: Some(31), image_number: None, quiet: 0, medium: KittyMedium::Direct };
+        assert_eq!(q.reply(), Some(b"\x1b_Gi=31;OK\x1b\\".to_vec()));
 
-        let q_num = KittyQuery { id: Some(2), image_number: Some(9), quiet: 0 };
-        assert_eq!(q_num.ok_reply(), Some(b"\x1b_Gi=2,I=9;OK\x1b\\".to_vec()));
+        let q_num = KittyQuery {
+            id: Some(2),
+            image_number: Some(9),
+            quiet: 0,
+            medium: KittyMedium::Direct,
+        };
+        assert_eq!(q_num.reply(), Some(b"\x1b_Gi=2,I=9;OK\x1b\\".to_vec()));
 
-        let quiet = KittyQuery { id: Some(1), image_number: None, quiet: 1 };
-        assert_eq!(quiet.ok_reply(), None);
+        // q=1 suppresses the OK for a supported (direct) medium.
+        let quiet = KittyQuery { id: Some(1), image_number: None, quiet: 1, medium: KittyMedium::Direct };
+        assert_eq!(quiet.reply(), None);
+    }
+
+    #[test]
+    fn reply_errors_on_unsupported_medium_so_app_falls_back() {
+        // File / shared-memory probes must get EBADT (not OK), otherwise the app
+        // transmits via a medium v1 drops and no image renders.
+        let file = KittyQuery { id: Some(2), image_number: None, quiet: 0, medium: KittyMedium::File };
+        assert_eq!(file.reply(), Some(b"\x1b_Gi=2;EBADT\x1b\\".to_vec()));
+
+        let tmp = KittyQuery { id: Some(3), image_number: None, quiet: 0, medium: KittyMedium::TempFile };
+        assert_eq!(tmp.reply(), Some(b"\x1b_Gi=3;EBADT\x1b\\".to_vec()));
+
+        let shmem = KittyQuery { id: Some(4), image_number: None, quiet: 0, medium: KittyMedium::SharedMemory };
+        assert_eq!(shmem.reply(), Some(b"\x1b_Gi=4;EBADT\x1b\\".to_vec()));
+
+        // q=1 still emits the error (only q>=2 suppresses errors).
+        let q1 = KittyQuery { id: Some(5), image_number: None, quiet: 1, medium: KittyMedium::File };
+        assert_eq!(q1.reply(), Some(b"\x1b_Gi=5;EBADT\x1b\\".to_vec()));
+        // q=2 suppresses the error.
+        let q2 = KittyQuery { id: Some(6), image_number: None, quiet: 2, medium: KittyMedium::File };
+        assert_eq!(q2.reply(), None);
     }
 
     #[test]
