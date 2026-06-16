@@ -4562,7 +4562,7 @@ fn osc_11_set_bg_produces_ansi_in_render_output() {
     let render_result = grid.render(0, 0, &style).unwrap();
     assert!(render_result.is_some(), "Expected render output");
 
-    let (chunks, _, _) = render_result.unwrap();
+    let (chunks, _, _, _) = render_result.unwrap();
     assert!(!chunks.is_empty(), "Expected at least one character chunk");
 
     // All chunks should carry the pane default bg
@@ -5632,7 +5632,7 @@ fn scroll_region_newline_bg_color_used_for_trailing_padding() {
     let content = b"\x1b[48;2;26;26;26m\x1b[1;5rAAA\r\nBBB\r\nCCC\r\nDDD\r\nEEE\r\nhi";
     let mut grid = create_grid_with_size_and_raw(10, 40, content);
     // read_changes returns character chunks with padding applied
-    let (chunks, _) = grid.read_changes(0, 0);
+    let (chunks, _, _) = grid.read_changes(0, 0);
     // Find the chunk for row 4 (the scroll-created row with "hi")
     let row_4_chunk = chunks.iter().find(|c| c.y == 4).expect("row 4 chunk");
     // The trailing padding character (last column) should have the row's bg_color

@@ -202,6 +202,10 @@ fn serialize_chunks(
     styled_underlines: bool,
     osc8_hyperlinks: bool,
     max_size: Option<Size>,
+    // Kitty: the visible chunks, and (render-state, client id) when the client's
+    // outer terminal supports Kitty. `None` render-state => gate to placeholder.
+    kitty_chunks: Option<&Vec<KittyImageChunk>>,
+    kitty_render: Option<(&mut crate::panes::kitty::KittyRenderState, u16)>,
 ) -> Result<String> {
     let err_context = || "failed to serialize input chunks".to_string();
 
@@ -286,6 +290,36 @@ fn serialize_chunks(
             }
         }
     }
+    // Kitty graphics: emit transmit-once + placement per visible chunk, gated on
+    // per-client outer-terminal support. Appended to the same image-vte block as
+    // sixel so it inherits the post-text z-order (images above text).
+    if let (Some(kitty_chunks), Some((render_state, client_id))) = (kitty_chunks, kitty_render) {
+        for chunk in kitty_chunks {
+            if let Some(size) = max_size {
+                if chunk.cell_y >= size.rows || chunk.cell_x >= size.cols {
+                    continue;
+                }
+            }
+            let image_vte = sixel_vte.get_or_insert_with(String::new);
+            vte_goto_instruction(chunk.cell_x, chunk.cell_y, image_vte)
+                .with_context(err_context)?;
+            let spec = crate::panes::kitty::KittyChunkSpec {
+                source_image_id: chunk.source_image_id,
+                placement_id: chunk.placement_id,
+                format: chunk.format,
+                compressed: chunk.compressed,
+                full_width: chunk.full_width,
+                full_height: chunk.full_height,
+                src_x: chunk.src_x,
+                src_y: chunk.src_y,
+                src_width: chunk.src_width,
+                src_height: chunk.src_height,
+                payload_b64: chunk.payload_b64.clone(),
+            };
+            let bytes = render_state.render_chunk_bytes(client_id, &spec);
+            image_vte.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
     if let Some(ref sixel_vte) = sixel_vte {
         // we do this at the end because of the implied z-index,
         // images should be above text unless the text was explicitly inserted after them (the
@@ -356,6 +390,12 @@ pub struct Output {
     post_vte_instructions: HashMap<ClientId, Vec<String>>,
     client_character_chunks: HashMap<ClientId, Vec<CharacterChunk>>,
     sixel_chunks: HashMap<ClientId, Vec<SixelImageChunk>>,
+    kitty_chunks: HashMap<ClientId, Vec<KittyImageChunk>>,
+    /// Per-client outer-terminal Kitty support snapshot for this render (set by
+    /// `Screen` before serialize). Clients absent / false get no Kitty bytes.
+    outer_supports_kitty: HashMap<ClientId, bool>,
+    /// Durable, per-client transmit-once state shared with `Screen`.
+    kitty_render_state: Rc<RefCell<crate::panes::kitty::KittyRenderState>>,
     link_handler: Option<Rc<RefCell<LinkHandler>>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
@@ -373,13 +413,48 @@ impl Output {
         character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
         styled_underlines: bool,
         osc8_hyperlinks: bool,
+        kitty_render_state: Rc<RefCell<crate::panes::kitty::KittyRenderState>>,
     ) -> Self {
         Output {
             sixel_image_store,
             character_cell_size,
             styled_underlines,
             osc8_hyperlinks,
+            kitty_render_state,
             ..Default::default()
+        }
+    }
+
+    /// Snapshot per-client Kitty support for this render (called by `Screen`).
+    pub fn set_outer_kitty_support(&mut self, support: HashMap<ClientId, bool>) {
+        self.outer_supports_kitty = support;
+    }
+
+    pub fn add_kitty_image_chunks_to_client(
+        &mut self,
+        client_id: ClientId,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        _z_index: Option<usize>,
+    ) {
+        if kitty_image_chunks.is_empty() {
+            return;
+        }
+        let entry = self.kitty_chunks.entry(client_id).or_insert_with(Vec::new);
+        entry.extend(kitty_image_chunks);
+    }
+
+    pub fn add_kitty_image_chunks_to_multiple_clients(
+        &mut self,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        client_ids: impl Iterator<Item = ClientId>,
+        z_index: Option<usize>,
+    ) {
+        for client_id in client_ids {
+            self.add_kitty_image_chunks_to_client(
+                client_id,
+                kitty_image_chunks.clone(),
+                z_index,
+            );
         }
     }
     pub fn add_clients(
@@ -535,6 +610,17 @@ impl Output {
             }
 
             // append the actual vte
+            let kitty_supported = self
+                .outer_supports_kitty
+                .get(&client_id)
+                .copied()
+                .unwrap_or(false);
+            let mut kitty_state = self.kitty_render_state.borrow_mut();
+            let kitty_render = if kitty_supported {
+                Some((&mut *kitty_state, client_id))
+            } else {
+                None
+            };
             client_serialized_render_instructions.push_str(
                 &serialize_chunks(
                     client_character_chunks,
@@ -544,9 +630,12 @@ impl Output {
                     self.styled_underlines,
                     self.osc8_hyperlinks,
                     None, // No size constraints for regular rendering
+                    self.kitty_chunks.get(&client_id),
+                    kitty_render,
                 )
                 .with_context(err_context)?,
             ); // TODO: less allocations?
+            drop(kitty_state);
 
             // append post-vte instructions for this client
             if let Some(post_vte_instructions_for_client) =
@@ -603,6 +692,17 @@ impl Output {
             }
 
             // append the actual vte with size constraints
+            let kitty_supported = self
+                .outer_supports_kitty
+                .get(&client_id)
+                .copied()
+                .unwrap_or(false);
+            let mut kitty_state = self.kitty_render_state.borrow_mut();
+            let kitty_render = if kitty_supported {
+                Some((&mut *kitty_state, client_id))
+            } else {
+                None
+            };
             client_serialized_render_instructions.push_str(
                 &serialize_chunks(
                     client_character_chunks,
@@ -612,9 +712,12 @@ impl Output {
                     self.styled_underlines,
                     self.osc8_hyperlinks,
                     max_size,
+                    self.kitty_chunks.get(&client_id),
+                    kitty_render,
                 )
                 .with_context(err_context)?,
             );
+            drop(kitty_state);
 
             // append post-vte instructions for this client
             if let Some(post_vte_instructions_for_client) =
@@ -1031,6 +1134,33 @@ pub struct SixelImageChunk {
     pub sixel_image_pixel_width: usize,
     pub sixel_image_pixel_height: usize,
     pub sixel_image_id: usize,
+}
+
+/// One visible Kitty image placement to render to a client's outer terminal.
+/// Self-contained (carries the base64 payload) so the serialize step needs no
+/// shared image store — only the per-client
+/// [`crate::panes::kitty::KittyRenderState`].
+#[derive(Debug, Clone)]
+pub struct KittyImageChunk {
+    /// Viewport cell position to place at.
+    pub cell_x: usize,
+    pub cell_y: usize,
+    /// Source app image id and this placement's id.
+    pub source_image_id: u32,
+    pub placement_id: u32,
+    /// Kitty `f=` format (24/32/100) and `o=z` compression flag.
+    pub format: u32,
+    pub compressed: bool,
+    /// Full source image pixel dims (for the one-time transmit of raw formats).
+    pub full_width: usize,
+    pub full_height: usize,
+    /// Source crop (px) within the image — handles partial scroll / clipping.
+    pub src_x: usize,
+    pub src_y: usize,
+    pub src_width: usize,
+    pub src_height: usize,
+    /// Undecoded base64 payload for the one-time transmit.
+    pub payload_b64: Vec<u8>,
 }
 
 impl CharacterChunk {

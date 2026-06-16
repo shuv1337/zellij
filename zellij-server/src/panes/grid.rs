@@ -111,7 +111,7 @@ pub(crate) fn namespace_notification_id(metadata: &str, pane_id: u32) -> String 
 use vte::{Params, Perform};
 use zellij_utils::{consts::VERSION, shared::version_number};
 
-use crate::output::{CharacterChunk, HighlightSelection, OutputBuffer, SixelImageChunk};
+use crate::output::{CharacterChunk, HighlightSelection, KittyImageChunk, OutputBuffer, SixelImageChunk};
 use crate::panes::alacritty_functions::{parse_number, xparse_color};
 use crate::panes::hyperlink_tracker::HyperlinkTracker;
 use crate::panes::link_handler::LinkHandler;
@@ -1501,7 +1501,11 @@ impl Grid {
         &mut self,
         x_offset: usize,
         y_offset: usize,
-    ) -> (Vec<CharacterChunk>, Vec<SixelImageChunk>) {
+    ) -> (
+        Vec<CharacterChunk>,
+        Vec<SixelImageChunk>,
+        Vec<KittyImageChunk>,
+    ) {
         let changed_character_chunks = self.output_buffer.changed_chunks_in_viewport(
             self.viewport.make_contiguous(),
             self.width,
@@ -1522,9 +1526,27 @@ impl Grid {
         if let Some(image_ids_to_reap) = self.sixel_grid.drain_image_ids_to_reap() {
             self.sixel_grid.reap_images(image_ids_to_reap);
         }
+        // Kitty placements visible in the viewport. Re-emitted each render the
+        // pane produces (Kitty images persist in the outer terminal between
+        // renders); the per-client transmit-once state lives in `Output`.
+        let changed_kitty_image_chunks = match *self.character_cell_size.borrow() {
+            Some(cell_size) => self.kitty_grid.visible_kitty_chunks(
+                self.lines_above.len(),
+                self.height,
+                self.width,
+                x_offset,
+                y_offset,
+                cell_size,
+            ),
+            None => Vec::new(),
+        };
         self.output_buffer.clear();
 
-        (changed_character_chunks, changed_sixel_image_chunks)
+        (
+            changed_character_chunks,
+            changed_sixel_image_chunks,
+            changed_kitty_image_chunks,
+        )
     }
     pub fn serialize(&self, scrollback_lines_to_serialize: Option<usize>) -> Option<String> {
         match scrollback_lines_to_serialize {
@@ -1560,13 +1582,21 @@ impl Grid {
         content_x: usize,
         content_y: usize,
         style: &Style,
-    ) -> Result<Option<(Vec<CharacterChunk>, Option<String>, Vec<SixelImageChunk>)>> {
+    ) -> Result<
+        Option<(
+            Vec<CharacterChunk>,
+            Option<String>,
+            Vec<SixelImageChunk>,
+            Vec<KittyImageChunk>,
+        )>,
+    > {
         if self.lock_renders {
             return Ok(None);
         }
         let raw_vte_output = String::new();
 
-        let (mut character_chunks, sixel_image_chunks) = self.read_changes(content_x, content_y);
+        let (mut character_chunks, sixel_image_chunks, kitty_image_chunks) =
+            self.read_changes(content_x, content_y);
 
         let plugin_highlight_selections = self.compute_plugin_highlight_selections();
 
@@ -1660,6 +1690,7 @@ impl Grid {
             character_chunks,
             Some(raw_vte_output),
             sixel_image_chunks,
+            kitty_image_chunks,
         )));
     }
     /// Returns the cursor position and whether it is visible.

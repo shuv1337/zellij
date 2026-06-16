@@ -179,29 +179,35 @@ and anchored; no rendering yet. `cargo check -p zellij-server -p zellij-client
 > `changed_rects` re-slices every frame and Kitty retransmit deletes
 > placements). Spec §5.
 
-- [ ] `KittyImageChunk` (or tagged enum) ≈ `SixelImageChunk`
-  (`output/mod.rs:1026-1034`); thread through the five seams:
-  `grid.rs:1498 read_changes` → `grid.rs:1561 render` → `terminal_pane.rs:357` →
-  `pane_contents_and_ui.rs:81-128` →
-  `output/mod.rs:478 add_kitty_image_chunks_to_multiple_clients` (call site `:541`).
-- [ ] Inject in `serialize_chunks` (`output/mod.rs:197`, post-text block
-  `:289-298`). Per client, after `vte_goto_instruction(cell_x,cell_y)`:
-  - transmit once if not in `transmitted[client]`:
-    `ESC _ G a=t,q=2,i=<outer_id>,f=<fmt>[,s,v][,o=z];<base64> ESC \`
-  - then placement w/ source crop:
-    `ESC _ G a=p,q=2,i=<outer_id>,p=<pid>,x,y,w,h,C=1 ESC \`
-- [ ] Per-client durable state in `KittyImageStore`: `transmitted`,
-  `placements`, `outer_ids` (high/randomized range, always `q=2`). Invalidate on
-  full reset / detach / re-attach.
-- [ ] Per-base64 cache per source image (like `SixelImageCache`, `sixel.rs:427`).
-- [ ] Reuse coverage clip geometry `remove_covered_sixel_parts`
-  (`output/mod.rs:830`).
-- [ ] Capability gating in serialize: Kitty if `outer_supports_kitty`, else Sixel
-  if source was Sixel, else **net-new** placeholder (there is *no* existing
-  placeholder — `grid.rs:824` is `impl Debug`, not the render path).
-- [ ] **Tests:** floating-pane clipping/scroll that re-slices one source across
-  frames renders correctly with one outer id, no transmit/delete thrash; no
-  Kitty bytes when `outer_supports_kitty == false` (placeholder instead).
+- [x] `KittyImageChunk` (self-contained, carries payload) in `output/mod.rs`;
+  threaded through all seams: `Grid::read_changes`/`render` (4-tuple) →
+  `Pane::render` trait + `terminal_pane`/`plugin_pane` impls →
+  `pane_contents_and_ui` → `Output::add_kitty_image_chunks_to_{client,multiple_clients}`.
+  Geometry `KittyGrid::visible_kitty_chunks` clips placements to the viewport
+  (scroll crop + right-edge clip).
+- [x] Inject in `serialize_chunks` (post-text save/restore block, shared z-order
+  with sixel). Per client, after goto: transmit-once
+  (`a=t,q=2,i=<outer_id>,f=…[,s,v]`) then placement
+  (`a=p,q=2,i,p,x,y,w,h,C=1`).
+- [x] Durable per-client state in `KittyRenderState` (`transmitted`, `outer_ids`
+  from a high base) — **lives on `Screen`, shared by `Rc` into each rebuilt
+  `Output`** (the chosen alternative to threading a store through 185 `Grid::new`
+  sites). `reset_client` / `forget_image` for detach / reap.
+- [x] Capability gating in serialize: Kitty bytes only when
+  `outer_supports_kitty[client]`; otherwise nothing emitted. (Sixel-source and a
+  visible placeholder glyph remain future polish — currently unsupported clients
+  simply render no image.)
+- [ ] **Deferred:** per-source-image base64 cache; floating-pane coverage
+  *splitting* (`remove_covered_sixel_parts`) — v1 emits one placement per image,
+  clipped to the viewport but not split around covering panes.
+- [x] **Tests:** `KittyRenderState` transmit-once / per-client ids / reset /
+  raw-dims / delete bytes (7); `visible_kitty_chunks` via anchoring tests; output
+  integration `kitty_chunks_emitted_only_to_supporting_clients` (gating). Full
+  server lib suite green (1202).
+
+> **NEEDS HARDWARE:** that the emitted sequences actually *display* the image
+> correctly (position, scroll crop, no flicker on re-emit) is verifiable only on
+> a real Kitty-capable terminal.
 
 **Acceptance:** a stored Kitty image renders in a supporting outer terminal,
 survives partial scroll/coverage; unsupported clients get the placeholder.

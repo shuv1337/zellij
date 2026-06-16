@@ -1416,6 +1416,10 @@ pub(crate) struct Screen {
     outer_supports_kitty: HashMap<ClientId, bool>,
     stacked_resize: Rc<RefCell<bool>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
+    /// Durable per-client Kitty render state (transmit-once tracking + outer
+    /// ids). Shared with each freshly-built `Output` so it survives Output's
+    /// per-render rebuild.
+    kitty_render_state: Rc<RefCell<crate::panes::kitty::KittyRenderState>>,
     terminal_emulator_colors: Rc<RefCell<Palette>>,
     terminal_emulator_color_codes: Rc<RefCell<HashMap<usize, String>>>,
     connected_clients: Rc<RefCell<HashMap<ClientId, bool>>>, // bool -> is_web_client
@@ -1579,6 +1583,9 @@ impl Screen {
             outer_supports_kitty: HashMap::new(),
             stacked_resize: Rc::new(RefCell::new(stacked_resize)),
             sixel_image_store: Rc::new(RefCell::new(SixelImageStore::default())),
+            kitty_render_state: Rc::new(RefCell::new(
+                crate::panes::kitty::KittyRenderState::default(),
+            )),
             style: client_attributes.style,
             connected_clients: Rc::new(RefCell::new(HashMap::new())),
             active_tab_ids: BTreeMap::new(),
@@ -2891,7 +2898,9 @@ impl Screen {
                 self.character_cell_size.clone(),
                 self.styled_underlines,
                 self.osc8_hyperlinks,
+                self.kitty_render_state.clone(),
             );
+            output.set_outer_kitty_support(self.outer_supports_kitty.clone());
 
             let has_ansi_subscribers = self.pane_render_subscribers.values().any(|s| s.ansi);
             output.collect_ansi_pane_contents =
@@ -3051,7 +3060,9 @@ impl Screen {
                     self.character_cell_size.clone(),
                     self.styled_underlines,
                     self.osc8_hyperlinks,
+                    self.kitty_render_state.clone(),
                 );
+                watcher_output.set_outer_kitty_support(self.outer_supports_kitty.clone());
 
                 let focused_tab_index_of_followed_client_id =
                     *self.active_tab_ids.get(&followed_client_id).unwrap_or(&0);

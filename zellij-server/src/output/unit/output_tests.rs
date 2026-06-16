@@ -22,6 +22,9 @@ fn create_test_output() -> Output {
         character_cell_size,
         styled_underlines,
         osc8_hyperlinks,
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::panes::kitty::KittyRenderState::default(),
+        )),
     )
 }
 
@@ -95,6 +98,49 @@ fn test_is_dirty_with_character_chunks() {
     assert!(
         output.is_dirty(),
         "Output should be dirty after adding character chunks"
+    );
+}
+
+#[test]
+fn kitty_chunks_emitted_only_to_supporting_clients() {
+    use crate::output::KittyImageChunk;
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(2);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+
+    // Client 1 supports Kitty; client 2 does not.
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    support.insert(2, false);
+    output.set_outer_kitty_support(support);
+
+    let chunk = KittyImageChunk {
+        cell_x: 0,
+        cell_y: 0,
+        source_image_id: 5,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 10,
+        full_height: 10,
+        src_x: 0,
+        src_y: 0,
+        src_width: 10,
+        src_height: 10,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    output.add_kitty_image_chunks_to_multiple_clients(vec![chunk], client_ids.iter().copied(), None);
+
+    let serialized = output.serialize().unwrap();
+    let c1 = serialized.get(&1).cloned().unwrap_or_default();
+    let c2 = serialized.get(&2).cloned().unwrap_or_default();
+    assert!(c1.contains("a=t,q=2"), "supporting client transmits: {:?}", c1);
+    assert!(c1.contains("a=p,q=2"), "supporting client places: {:?}", c1);
+    assert!(
+        !c2.contains("_G"),
+        "non-supporting client gets no Kitty bytes: {:?}",
+        c2
     );
 }
 

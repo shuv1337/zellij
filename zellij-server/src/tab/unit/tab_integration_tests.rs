@@ -3406,7 +3406,15 @@ fn move_floating_pane_with_sixel_image() {
         width: 8,
         height: 21,
     })));
-    let mut output = Output::new(sixel_image_store.clone(), character_cell_size, true, true);
+    let mut output = Output::new(
+        sixel_image_store.clone(),
+        character_cell_size,
+        true,
+        true,
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::panes::kitty::KittyRenderState::default(),
+        )),
+    );
 
     tab.toggle_floating_panes(Some(client_id), None, None)
         .unwrap();
@@ -3465,7 +3473,15 @@ fn floating_pane_above_sixel_image() {
         width: 8,
         height: 21,
     })));
-    let mut output = Output::new(sixel_image_store.clone(), character_cell_size, true, true);
+    let mut output = Output::new(
+        sixel_image_store.clone(),
+        character_cell_size,
+        true,
+        true,
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::panes::kitty::KittyRenderState::default(),
+        )),
+    );
 
     tab.toggle_floating_panes(Some(client_id), None, None)
         .unwrap();

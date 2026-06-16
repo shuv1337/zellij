@@ -1118,7 +1118,14 @@ impl Pane for MockPane {
     fn render(
         &mut self,
         _client_id: Option<ClientId>,
-    ) -> Result<Option<(Vec<CharacterChunk>, Option<String>, Vec<SixelImageChunk>)>> {
+    ) -> Result<
+        Option<(
+            Vec<CharacterChunk>,
+            Option<String>,
+            Vec<SixelImageChunk>,
+            Vec<crate::output::KittyImageChunk>,
+        )>,
+    > {
         unimplemented!()
     }
     fn render_frame(

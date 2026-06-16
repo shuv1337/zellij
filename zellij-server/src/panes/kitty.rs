@@ -16,7 +16,9 @@
 //! Phases 1c+. See `GOAL-kitty-graphics.md` and `KITTY_GRAPHICS_PLAN.md`.
 
 use super::sixel::PixelRect;
+use crate::output::KittyImageChunk;
 use std::collections::HashMap;
+use zellij_utils::pane_size::SizeInPixels;
 
 /// The classification of a parsed Kitty graphics command, as far as the Grid
 /// boundary cares. The Grid acts on this without re-parsing.
@@ -481,6 +483,212 @@ impl KittyGrid {
     pub fn placements(&self) -> &[KittyPlacement] {
         &self.placements
     }
+
+    /// Produce the visible-in-viewport [`KittyImageChunk`]s for this grid. Each
+    /// placement is clipped to the viewport (top/bottom by scroll, right edge by
+    /// width); the source crop (`src_*`) carries the visible region. Coverage
+    /// splitting around floating panes is applied later in `Output` (reusing the
+    /// sixel geometry), so v1 emits one chunk per visible placement.
+    pub fn visible_kitty_chunks(
+        &self,
+        scrollback_size_in_lines: usize,
+        viewport_rows: usize,
+        viewport_width_in_cells: usize,
+        viewport_x_offset: usize,
+        viewport_y_offset: usize,
+        cell_size: SizeInPixels,
+    ) -> Vec<KittyImageChunk> {
+        let (cell_w, cell_h) = (cell_size.width, cell_size.height);
+        if cell_w == 0 || cell_h == 0 {
+            return vec![];
+        }
+        let viewport_top_px = (scrollback_size_in_lines * cell_h) as isize;
+        let viewport_bottom_px = viewport_top_px + (viewport_rows * cell_h) as isize;
+        let viewport_right_px = viewport_width_in_cells * cell_w;
+
+        let mut chunks = Vec::new();
+        for (idx, placement) in self.placements.iter().enumerate() {
+            let Some(image) = self.images.get(&placement.image_id) else {
+                continue;
+            };
+            let rect = &placement.rect;
+            let image_top = rect.y;
+            let image_bottom = rect.y + rect.height as isize;
+            let visible_top = image_top.max(viewport_top_px);
+            let visible_bottom = image_bottom.min(viewport_bottom_px);
+            if visible_bottom <= visible_top {
+                continue; // scrolled fully out of the viewport
+            }
+            // Source crop within the image.
+            let src_y = (visible_top - image_top) as usize;
+            let src_height = (visible_bottom - visible_top) as usize;
+            let src_width = if rect.x + rect.width <= viewport_right_px {
+                rect.width
+            } else {
+                viewport_right_px.saturating_sub(rect.x)
+            };
+            if src_width == 0 {
+                continue;
+            }
+            // Viewport cell position of the visible top-left (cell-aligned: both
+            // the anchor and the viewport top are multiples of cell_h).
+            let cell_x = viewport_x_offset + rect.x / cell_w;
+            let cell_y = viewport_y_offset + ((visible_top - viewport_top_px) as usize) / cell_h;
+
+            let (full_w, full_h) = image
+                .dimensions
+                .unwrap_or((rect.width as u32, rect.height as u32));
+            let format = match image.control.format {
+                KittyFormat::Rgb => 24,
+                KittyFormat::Rgba => 32,
+                KittyFormat::Png => 100,
+            };
+            chunks.push(KittyImageChunk {
+                cell_x,
+                cell_y,
+                source_image_id: placement.image_id,
+                placement_id: (idx as u32) + 1,
+                format,
+                compressed: image.control.compressed,
+                full_width: full_w as usize,
+                full_height: full_h as usize,
+                src_x: 0,
+                src_y,
+                src_width,
+                src_height,
+                payload_b64: image.payload_b64.clone(),
+            });
+        }
+        chunks
+    }
+}
+
+/// Durable, per-client state for rendering Kitty images to outer terminals.
+///
+/// `Output` is rebuilt every render, so this lives on `Screen` (behind an
+/// `Rc<RefCell>`) and is handed to each fresh `Output`. It implements the
+/// "transmit once, then place" model: one outer-terminal image id per
+/// `(client, source image id)`, transmitted a single time, then re-placed each
+/// frame. zellij allocates outer ids from a high base so they do not collide
+/// with ids an inner app might use if any passthrough ever leaks.
+#[derive(Debug)]
+pub struct KittyRenderState {
+    /// `(client, source image id)` → outer-terminal image id.
+    outer_ids: HashMap<(u16, u32), u32>,
+    /// Outer ids already transmitted to each client's terminal.
+    transmitted: HashMap<(u16, u32), bool>,
+    /// Next outer id to hand out (allocated from a high base).
+    next_outer_id: u32,
+}
+
+impl Default for KittyRenderState {
+    fn default() -> Self {
+        KittyRenderState {
+            outer_ids: HashMap::new(),
+            transmitted: HashMap::new(),
+            // High base: keep zellij's outer ids clear of low app-chosen ids.
+            next_outer_id: 0x9000_0000,
+        }
+    }
+}
+
+impl KittyRenderState {
+    /// Resolve (allocating if needed) the outer-terminal id for a source image
+    /// on a given client.
+    fn outer_id(&mut self, client_id: u16, source_image_id: u32) -> u32 {
+        if let Some(id) = self.outer_ids.get(&(client_id, source_image_id)) {
+            return *id;
+        }
+        let id = self.next_outer_id;
+        self.next_outer_id = self.next_outer_id.wrapping_add(1).max(0x9000_0000);
+        self.outer_ids.insert((client_id, source_image_id), id);
+        id
+    }
+
+    /// Forget all state for a client (detach / re-attach: the new outer terminal
+    /// holds nothing).
+    pub fn reset_client(&mut self, client_id: u16) {
+        self.outer_ids.retain(|(c, _), _| *c != client_id);
+        self.transmitted.retain(|(c, _), _| *c != client_id);
+    }
+
+    /// Forget a source image across all clients (on reap / delete). Returns the
+    /// outer ids that were live so the caller can emit deletes (Phase 4).
+    pub fn forget_image(&mut self, source_image_id: u32) -> Vec<(u16, u32)> {
+        let mut deleted = Vec::new();
+        self.outer_ids.retain(|(c, src), outer| {
+            if *src == source_image_id {
+                deleted.push((*c, *outer));
+                false
+            } else {
+                true
+            }
+        });
+        self.transmitted
+            .retain(|(_, src), _| *src != source_image_id);
+        deleted
+    }
+
+    /// Emit the outer-terminal byte sequence to render one visible chunk on
+    /// `client_id`: a one-time transmit (`a=t`) of the source image, then a
+    /// placement (`a=p`) with a source crop. `q=2` silences acks; `C=1` keeps
+    /// the outer cursor from moving. Always quiet to the outer terminal.
+    pub fn render_chunk_bytes(
+        &mut self,
+        client_id: u16,
+        chunk: &KittyChunkSpec,
+    ) -> Vec<u8> {
+        let outer_id = self.outer_id(client_id, chunk.source_image_id);
+        let mut out = Vec::new();
+        // Transmit the source image once per (client, image).
+        let already = *self.transmitted.get(&(client_id, chunk.source_image_id)).unwrap_or(&false);
+        if !already {
+            let mut keys = format!("a=t,q=2,i={},f={}", outer_id, chunk.format);
+            if chunk.compressed {
+                keys.push_str(",o=z");
+            }
+            if chunk.format != 100 {
+                // raw formats need explicit dims
+                keys.push_str(&format!(",s={},v={}", chunk.full_width, chunk.full_height));
+            }
+            out.extend_from_slice(b"\x1b_G");
+            out.extend_from_slice(keys.as_bytes());
+            out.push(b';');
+            out.extend_from_slice(&chunk.payload_b64);
+            out.extend_from_slice(b"\x1b\\");
+            self.transmitted.insert((client_id, chunk.source_image_id), true);
+        }
+        // Place (with source crop) — re-emitted each frame; cheap.
+        let place = format!(
+            "\x1b_Ga=p,q=2,i={},p={},x={},y={},w={},h={},C=1\x1b\\",
+            outer_id, chunk.placement_id, chunk.src_x, chunk.src_y, chunk.src_width, chunk.src_height
+        );
+        out.extend_from_slice(place.as_bytes());
+        out
+    }
+
+    /// Emit a delete of a source image's placements/data on a client.
+    pub fn delete_image_bytes(outer_id: u32) -> Vec<u8> {
+        format!("\x1b_Ga=d,d=i,q=2,i={}\x1b\\", outer_id).into_bytes()
+    }
+}
+
+/// The data a serialize step needs to emit one visible Kitty placement. Mirrors
+/// the fields of `output::KittyImageChunk` but kept here so the emission logic is
+/// unit-testable without the `Output` machinery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyChunkSpec {
+    pub source_image_id: u32,
+    pub placement_id: u32,
+    pub format: u32,
+    pub compressed: bool,
+    pub full_width: usize,
+    pub full_height: usize,
+    pub src_x: usize,
+    pub src_y: usize,
+    pub src_width: usize,
+    pub src_height: usize,
+    pub payload_b64: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -702,5 +910,86 @@ mod tests {
         let mut kg = KittyGrid::default();
         kg.feed_chunk(store_cmd(b"a=t,f=32,s=1,v=1;AAAA")); // no i=
         assert_eq!(kg.image_count(), 1);
+    }
+
+    // --- KittyRenderState emission (Phase 3) ---
+
+    fn spec() -> KittyChunkSpec {
+        KittyChunkSpec {
+            source_image_id: 7,
+            placement_id: 1,
+            format: 100,
+            compressed: false,
+            full_width: 20,
+            full_height: 10,
+            src_x: 0,
+            src_y: 0,
+            src_width: 20,
+            src_height: 10,
+            payload_b64: b"AAAA".to_vec(),
+        }
+    }
+
+    #[test]
+    fn render_transmits_once_then_places() {
+        let mut rs = KittyRenderState::default();
+        let first = rs.render_chunk_bytes(1, &spec());
+        let first = String::from_utf8(first).unwrap();
+        // First frame: a transmit (a=t) AND a placement (a=p).
+        assert!(first.contains("a=t,q=2"), "first frame transmits: {}", first);
+        assert!(first.contains("a=p,q=2"), "first frame places: {}", first);
+        assert!(first.contains(";AAAA"), "first frame carries payload");
+
+        let second = rs.render_chunk_bytes(1, &spec());
+        let second = String::from_utf8(second).unwrap();
+        // Second frame: placement only, no re-transmit / no payload.
+        assert!(!second.contains("a=t"), "must not re-transmit: {}", second);
+        assert!(second.contains("a=p,q=2"), "still re-places: {}", second);
+        assert!(!second.contains("AAAA"), "no payload on re-place");
+    }
+
+    #[test]
+    fn render_per_client_outer_ids_are_distinct_and_each_transmits() {
+        let mut rs = KittyRenderState::default();
+        let c1 = String::from_utf8(rs.render_chunk_bytes(1, &spec())).unwrap();
+        let c2 = String::from_utf8(rs.render_chunk_bytes(2, &spec())).unwrap();
+        // Each client gets its own transmit (separate outer terminals).
+        assert!(c1.contains("a=t") && c2.contains("a=t"));
+    }
+
+    #[test]
+    fn render_reset_client_forces_retransmit() {
+        let mut rs = KittyRenderState::default();
+        rs.render_chunk_bytes(1, &spec());
+        rs.reset_client(1);
+        let again = String::from_utf8(rs.render_chunk_bytes(1, &spec())).unwrap();
+        assert!(again.contains("a=t"), "re-attach must re-transmit: {}", again);
+    }
+
+    #[test]
+    fn render_raw_format_includes_dims_in_transmit() {
+        let mut rs = KittyRenderState::default();
+        let mut s = spec();
+        s.format = 32; // RGBA raw
+        let bytes = String::from_utf8(rs.render_chunk_bytes(1, &s)).unwrap();
+        assert!(bytes.contains("s=20,v=10"), "raw transmit carries dims: {}", bytes);
+    }
+
+    #[test]
+    fn forget_image_returns_live_outer_ids_and_clears() {
+        let mut rs = KittyRenderState::default();
+        rs.render_chunk_bytes(1, &spec());
+        rs.render_chunk_bytes(2, &spec());
+        let deleted = rs.forget_image(7);
+        assert_eq!(deleted.len(), 2, "both clients' outer ids returned for delete");
+        // After forgetting, the next render re-transmits (fresh id).
+        let again = String::from_utf8(rs.render_chunk_bytes(1, &spec())).unwrap();
+        assert!(again.contains("a=t"));
+    }
+
+    #[test]
+    fn delete_image_bytes_well_formed() {
+        let bytes = String::from_utf8(KittyRenderState::delete_image_bytes(0x90000000)).unwrap();
+        assert_eq!(bytes, "\x1b_Ga=d,d=i,q=2,i=2415919104\x1b\\");
     }
 }
