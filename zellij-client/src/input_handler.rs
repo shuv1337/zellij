@@ -327,6 +327,17 @@ impl InputHandler {
                 self.os_input
                     .send_to_server(ClientToServerMsg::HostTerminalThemeChanged { mode });
             },
+            AnsiStdinInstruction::KittyGraphics(supported) => {
+                // TODO(Phase 1d, gated): send
+                // `ClientToServerMsg::KittyGraphicsSupport { supported }` once the
+                // protobuf wire contract is extended and reviewed. For now the
+                // probe result is observed/logged only; the server keeps its
+                // conservative default (unsupported) until that wiring lands.
+                log::info!(
+                    "Kitty graphics outer-terminal support probe resolved: {}",
+                    supported
+                );
+            },
         }
     }
     fn handle_mouse_event(&mut self, mouse_event: &MouseEvent) {

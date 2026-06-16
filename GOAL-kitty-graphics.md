@@ -126,24 +126,33 @@ downstream consumes them yet.
 > always emits the APC OK before the trailing DA), with `strip_replies` gaining a
 > separate APC branch purely for residue removal.
 
-- [ ] `stdin_ansi_parser.rs`: third `strip_replies` branch for APC (`:424-480`)
-  + `partial_apc` buffer (`:232-234`), mirroring OSC/CSI cap/`finalize()`/
-  split-feed handling; classify Kitty replies; strip complete APC replies from
-  keyboard residue. **Plus** the stream-ordered probe pre-scan (above).
-- [ ] `build_startup_query_string()` (`stdin_handler.rs:274`): append
-  `\x1b_Gi=<probe>,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c`. DA1 (`ESC[c`) is the
-  negative-detection barrier; the scanner implements the barrier itself (probe is
-  fire-and-forget, `:50-54`, not on the `completed_forward` path `:358-366`).
-- [ ] `HostReply::KittyGraphics(bool)`; handle in `input_handler.rs`; send
-  `ClientToServerMsg::KittyGraphicsSupport { supported }`; `route.rs` attaches
-  the connection `client_id` → `ScreenInstruction::TerminalKittyGraphicsSupport(ClientId,bool)`.
+**Client-side (DONE — unit-tested, no hardware needed):**
+- [x] `stdin_ansi_parser.rs`: third `strip_replies` branch for APC + `partial_apc`
+  buffer (cap/finalize/split-feed handling), `apc_status`/`apc_is_kitty_ok`
+  helpers; strips Kitty replies from keyboard residue.
+- [x] Stream-ordered probe pre-scan `scan_kitty_probe` + `KittyProbeState` +
+  `expect_kitty_graphics_probe()`. Resolves OK-APC-before-DA → `true`, DA-first
+  → `false`, at most once; conservative no-resolve fallback.
+- [x] `build_startup_query_string()` appends the probe + trailing DA; the startup
+  writer arms the probe on the parser before writing.
+- [x] `HostReply::KittyGraphics(bool)` variant; `input_handler.rs` arm logs the
+  result (the server send is gated — see below).
+- [x] **Tests (8 green):** supported (OK before DA), unsupported (DA only),
+  OK-wins-in-same-chunk, C1 ST terminator, APC split across feeds, inert when
+  unarmed, resolves-once, APC stripped from residue with surrounding text.
+
+**GATED — protobuf wire-contract change + server map (awaiting review):**
+- [ ] `input_handler.rs` send `ClientToServerMsg::KittyGraphicsSupport { supported }`;
+  `route.rs` attaches `client_id` → `ScreenInstruction::TerminalKittyGraphicsSupport`.
 - [ ] IPC contract: `ipc.rs`, `client_server_contract/*.proto`,
-  `protobuf_conversion.rs` + roundtrip test.
-- [ ] `Screen`: `outer_supports_kitty: HashMap<ClientId,bool>`, default false on
-  connect, set on probe reply, remove on detach. Web clients stay false.
-- [ ] **Tests:** startup probe success; negative path with DA barrier (assert
-  against ghostty/wezterm/foot semantics, not just kitty); split APC reply; APC
-  reply stripped from residue.
+  `protobuf_conversion.rs` + roundtrip test. **← the outward-facing wire change.**
+- [ ] `Screen`: `outer_supports_kitty: HashMap<ClientId,bool>` (default false,
+  set on probe reply, remove on detach; web clients stay false).
+
+**NEEDS HARDWARE (cannot verify autonomously):**
+- [ ] Validate the DA-barrier negative-detection assumption against real
+  ghostty/wezterm/foot/kitty — the unit tests cover the *logic*, not the
+  per-terminal *ordering guarantee*.
 
 ### 1e. Inner `a=q` aggregate (Phase 5 self-query truth)
 - [ ] Answer inner `a=q` OK if **any** regular client on the pane's tab has
