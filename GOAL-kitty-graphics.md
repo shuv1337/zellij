@@ -108,11 +108,28 @@ downstream consumes them yet.
   multichunk/place/anonymous-id (kitty.rs); Grid-level `a=T` stores+anchors at
   the right `PixelRect` + advances cursor 2 rows, `a=t` stores without placement.
 
-### 1d/Phase 2. Per-client outer-terminal capability detection
+### 1d/Phase 2. Per-client outer-terminal capability detection — NOT STARTED
+> **⚠ Inflection point — see analysis below.** This phase changes the
+> client↔server **protobuf wire contract** (hard to reverse) and its core
+> DA-barrier logic is only truly verifiable against **real terminals**
+> (ghostty/wezterm/foot/kitty). Both warrant a decision before proceeding.
+>
+> **Parser-ordering subtlety (mapped):** the client parser
+> (`stdin_ansi_parser.rs`) classifies via vendored `termwiz::InputParser`, which
+> surfaces OSC + DCS but **not APC** — so the Kitty OK reply
+> (`ESC _ Gi=…;OK ESC \`) is invisible to the event loop and must be detected by
+> a byte-level scan. The DA barrier (`ESC[c`) IS surfaced by termwiz (handled at
+> `:358`). Negative detection needs APC-OK-vs-DA resolved in **stream order**, but
+> APC (byte scan) and DA (termwiz event loop) are processed in *different passes*
+> → a naive split resolves them out of order. Fix: a dedicated probe pre-scan in
+> `feed()` that resolves the probe state in stream order (a conformant terminal
+> always emits the APC OK before the trailing DA), with `strip_replies` gaining a
+> separate APC branch purely for residue removal.
+
 - [ ] `stdin_ansi_parser.rs`: third `strip_replies` branch for APC (`:424-480`)
   + `partial_apc` buffer (`:232-234`), mirroring OSC/CSI cap/`finalize()`/
   split-feed handling; classify Kitty replies; strip complete APC replies from
-  keyboard residue.
+  keyboard residue. **Plus** the stream-ordered probe pre-scan (above).
 - [ ] `build_startup_query_string()` (`stdin_handler.rs:274`): append
   `\x1b_Gi=<probe>,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c`. DA1 (`ESC[c`) is the
   negative-detection barrier; the scanner implements the barrier itself (probe is
