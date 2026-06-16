@@ -45,30 +45,25 @@ downstream consumes them yet.
 > path — build the client plumbing first, then wire replies. Phases 1 and 2 land
 > together.
 
-### 1a. `Grid::apc_dispatch` + kitty module skeleton
-- [ ] New `zellij-server/src/panes/kitty.rs`; export from
-  `zellij-server/src/panes/mod.rs`.
-- [ ] Define the router contract: `KittyOutcome { Query(KittyQuery), Store(KittyCommand), Ignore }`
-  and `pub fn dispatch(body: &[u8]) -> KittyOutcome` (full key parsing can start
-  minimal: recognize `a=q` → `Query`, transmit/display/place → `Store`, else
-  `Ignore`).
-- [ ] Implement `fn apc_dispatch(&mut self, bytes: &[u8])` in
-  `impl Perform for Grid` (`grid.rs:3434`, place after `osc_dispatch`):
-  G-prefix gate via `split_first()`; `Query` → push
-  `HostQuery::KittyGraphics(..)` onto `pending_forwarded_queries`; `Store` →
-  **only** under `current_cursor_pixel_coordinates().is_some()`. **Asymmetric
-  gate** — `Query` must work when cell size is `None` (startup probe window).
-  **No kitty-specific pause flag.** (Spec §3.)
-- [ ] `HostQuery::KittyGraphics` variant in `host_query.rs:45`; `to_query_bytes`
-  arm returns `Vec::new()` (`:73`, like `ColorPaletteMode` at `:98`).
-- [ ] Local short-circuit in `screen.rs::forward_host_query` (`:2496`) mirroring
-  `ColorPaletteMode` (`:2506-2509`): `answer_kitty_graphics_query_locally(pane_id, ..)`,
-  guard `PaneId::Plugin(_)` early (`:2538-2540`), write the synthesized reply to
-  the pane pty. Honor `q` quiet mode for inner-app replies.
-- [ ] **Test:** drive `ESC _ G a=q ST` through a `Grid`; assert
-  `pending_forwarded_queries` gets a `KittyGraphics`. Non-`G` APC leaves it
-  empty. `a=q` followed by normal text pauses, replies, then replays in order
-  (reuse the existing forward-query test scaffolding).
+### 1a. `Grid::apc_dispatch` + kitty module skeleton ✅ DONE
+- [x] New `zellij-server/src/panes/kitty.rs`; exported from `panes/mod.rs`.
+- [x] Router contract `KittyOutcome { Query(KittyQuery), Store(KittyCommand), Ignore }`
+  + `pub fn dispatch(body: &[u8]) -> KittyOutcome` with key parser. `KittyQuery`
+  carries `id`/`image_number`/`quiet` and an `ok_reply()` builder.
+- [x] `Grid::apc_dispatch` (after `esc_dispatch`): G-gate via `split_first()`;
+  `Query` → push `HostQuery::KittyGraphics(..)` (NOT cell-size gated — startup
+  probe window); `Store` → gated on `current_cursor_pixel_coordinates().is_some()`
+  (storage stub, Phase 1c). No kitty-specific pause flag.
+- [x] `HostQuery::KittyGraphics(KittyQuery)` variant + `to_query_bytes` →
+  `Vec::new()`; added the unreachable cache-fallback arm too.
+- [x] `screen.rs::forward_host_query` short-circuit →
+  `answer_kitty_graphics_query_locally`: guards `PaneId::Plugin`, conservative
+  silent default (TODO 1e gates on the any-client aggregate), always unblocks the
+  forward-paused pane. Honors `q` quiet via `KittyQuery::ok_reply`.
+- [x] **Tests (10, green):** 7 kitty-module (`dispatch` classification, malformed
+  keys, `ok_reply`), 3 Grid-level (`a=q` enrols `KittyGraphics`; non-`G`/SOS
+  ignored; `a=T` transmit does not enrol). `cargo check -p zellij-server` clean;
+  no regression in existing forwarded-query / `csi_996n` tests.
 
 ### 1b. Protocol parsing & reassembly (`kitty.rs`)
 - [ ] Parse control keys: `a,i,I,p,f,t,m,s,v,c,r,x,y,w,h,z,o,q` (ignore unknown).

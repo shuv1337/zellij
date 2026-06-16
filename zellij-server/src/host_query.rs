@@ -65,6 +65,13 @@ pub enum HostQuery {
     /// to the wire it synthesises `\e[?997;{0|1|2}n` directly into the
     /// originating pane's pty.
     ColorPaletteMode,
+    /// `ESC _ G … a=q … ST` — a Kitty graphics support probe from an app
+    /// inside a pane. Answered locally: zellij *is* the terminal the app
+    /// talks to, so the OK/silent decision is made from per-client outer
+    /// terminal support (never forwarded to the host). The Screen handler
+    /// short-circuits this variant and synthesises `ESC _ G i=<id> ; OK ST`
+    /// into the originating pane's pty when Kitty can be rendered.
+    KittyGraphics(crate::panes::kitty::KittyQuery),
 }
 
 impl HostQuery {
@@ -96,6 +103,9 @@ impl HostQuery {
             // bypass `Screen::forward_host_query` for this variant
             // shouldn't be calling `to_query_bytes` on it at all.
             HostQuery::ColorPaletteMode => Vec::new(),
+            // `KittyGraphics` is answered locally by Zellij and never sent on
+            // the wire (same contract as `ColorPaletteMode`).
+            HostQuery::KittyGraphics(_) => Vec::new(),
         }
     }
 }

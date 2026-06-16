@@ -4515,6 +4515,41 @@ impl Perform for Grid {
             },
         }
     }
+
+    /// APC (Application Program Command). The vendored `vte` fork
+    /// (`vendor/vte-apc`) buffers the APC body and delivers it here once on ST,
+    /// with introducer/terminator stripped. Only Kitty graphics APCs
+    /// (`ESC _ G <keys>[;<payload>] ST`) are ours; every other APC user — and
+    /// the SOS/PM payloads that collapse onto the same vte state — must be left
+    /// untouched, hence the leading-`G` gate.
+    fn apc_dispatch(&mut self, bytes: &[u8]) {
+        // Not a Kitty graphics command (incl. SOS / PM): ignore.
+        let Some((&b'G', rest)) = bytes.split_first() else {
+            return;
+        };
+        match crate::panes::kitty::dispatch(rest) {
+            // Support probe: enrol on the existing forwarded-query pipeline so
+            // Screen synthesises the reply locally, ordered with surrounding PTY
+            // bytes via `forward_paused`/`pending_pty_input`. This MUST work even
+            // when the cell pixel size is unknown (the startup-probe window), so
+            // it is deliberately NOT gated on cursor pixel coordinates, and adds
+            // no Kitty-specific pause flag.
+            crate::panes::kitty::KittyOutcome::Query(query) => {
+                self.pending_forwarded_queries
+                    .push(crate::host_query::HostQuery::KittyGraphics(query));
+            },
+            // Transmit / display / place: anchoring needs the cell pixel size
+            // (Phase 1c). Gate exactly like the sixel `hook`; drop silently when
+            // unknown, matching sixel.
+            crate::panes::kitty::KittyOutcome::Store(_cmd) => {
+                if self.current_cursor_pixel_coordinates().is_some() {
+                    // TODO(Phase 1c): store the image and create a placement on
+                    // the KittyGrid, then `mark_for_rerender()`.
+                }
+            },
+            crate::panes::kitty::KittyOutcome::Ignore => {},
+        }
+    }
 }
 
 #[derive(Clone)]

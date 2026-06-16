@@ -6102,3 +6102,65 @@ fn csi_5n_status_query_still_handled_locally() {
         "DSR 5 must still produce its local 'all good' reply"
     );
 }
+
+#[test]
+fn kitty_a_q_pushes_kitty_graphics_query_to_forwarded_queries() {
+    use crate::host_query::HostQuery;
+    use crate::panes::kitty::KittyQuery;
+    // A Kitty graphics support probe arrives as an APC sequence
+    // (`ESC _ G … a=q … ST`). The vendored vte fork surfaces it to
+    // `Grid::apc_dispatch`, which must enrol it on the forwarded-query
+    // pipeline so Screen answers locally and in stream order.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Gi=31,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(
+        grid.pending_forwarded_queries,
+        vec![HostQuery::KittyGraphics(KittyQuery {
+            id: Some(31),
+            image_number: None,
+            quiet: 0,
+        })],
+        "Kitty a=q must enrol HostQuery::KittyGraphics for Screen to short-circuit"
+    );
+    assert!(
+        grid.pending_messages_to_pty.is_empty(),
+        "Grid must NOT answer the Kitty probe locally — Screen owns capability gating"
+    );
+}
+
+#[test]
+fn non_g_apc_is_ignored_by_grid() {
+    // SOS (`ESC X`) and PM (`ESC ^`) collapse onto vte's APC state and reach
+    // `apc_dispatch` too; the leading-`G` gate must drop them (and any non-Kitty
+    // APC) without enrolling a query.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Zsome-other-apc\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    for byte in b"\x1bXa-sos-string\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(
+        grid.pending_forwarded_queries.is_empty(),
+        "non-`G` APC / SOS must not enrol a forwarded query"
+    );
+}
+
+#[test]
+fn kitty_transmit_command_does_not_enrol_a_query() {
+    // A transmit/display command (`a=T`) is a Store, not a Query: it must not
+    // land on the forwarded-query pipeline (Phase 1c handles storage).
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(
+        grid.pending_forwarded_queries.is_empty(),
+        "a=T transmit must not enrol a forwarded query"
+    );
+}

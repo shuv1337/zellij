@@ -2507,6 +2507,14 @@ impl Screen {
             self.answer_color_palette_mode_query_locally(pane_id);
             return STARTUP_SENTINEL_TOKEN; // sentinel: no real forward happened
         }
+        // KittyGraphics support probes are likewise answered locally — zellij is
+        // the terminal the inner app talks to, so the OK/silent decision is made
+        // from per-client outer-terminal support, never forwarded to the host.
+        if let crate::host_query::HostQuery::KittyGraphics(kitty_query) = &query {
+            let kitty_query = kitty_query.clone();
+            self.answer_kitty_graphics_query_locally(pane_id, kitty_query);
+            return STARTUP_SENTINEL_TOKEN; // sentinel: no real forward happened
+        }
         let token = self.next_forward_token;
         // Skip over the reserved sentinel (0) on wrap; allocate a fresh
         // u32 for every forward.
@@ -2565,6 +2573,42 @@ impl Screen {
         // stream position and any PTY input the app emitted while
         // waiting is replayed.
         let _ = self.resume_pane_after_forward(pane_id, reply);
+    }
+
+    /// Answer a Kitty graphics support probe (`a=q`) locally. zellij *is* the
+    /// terminal the inner app talks to, so the OK/silent decision is made from
+    /// per-client outer-terminal support — never forwarded to the host. Plugin
+    /// panes are skipped (they have no notion of VT-protocol queries). When no
+    /// viewing client can render Kitty we stay silent (the negative-detection-
+    /// correct behaviour: the app's following `ESC[c` DA1 resolves the probe as
+    /// "unsupported"), but we still unblock the forward-paused pane so buffered
+    /// PTY bytes are replayed in stream order.
+    fn answer_kitty_graphics_query_locally(
+        &mut self,
+        pane_id: PaneId,
+        query: crate::panes::kitty::KittyQuery,
+    ) {
+        if matches!(pane_id, PaneId::Plugin(_)) {
+            return;
+        }
+        // TODO(Phase 1e): answer OK iff any regular client viewing the pane's
+        // tab has `outer_supports_kitty == true` (the "any client" aggregate),
+        // populated by capability detection (Phase 1d). Until that lands, no
+        // client is known to support Kitty, so the aggregate is false and we
+        // stay silent.
+        let supported = false;
+        let reply = if supported {
+            query.ok_reply().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !reply.is_empty() {
+            let _ = self.resume_pane_after_forward(pane_id, reply);
+        } else if self.is_any_tab_pane_forward_paused(pane_id) {
+            // Silent answer, but the pane was forward-paused on dispatch — owe
+            // it an unblock cycle so buffered bytes replay.
+            let _ = self.resume_pane_after_forward(pane_id, Vec::new());
+        }
     }
 
     /// Dispatch a forward to the client and mark the slot as in-flight.
@@ -2782,6 +2826,10 @@ impl Screen {
                 Some(HostTerminalThemeMode::Light) => b"\x1b[?997;2n".to_vec(),
                 None => Vec::new(),
             },
+            // Should not reach here: KittyGraphics short-circuits in
+            // `forward_host_query` (it is answered locally from per-client
+            // capability, never via this cache-fallback path).
+            HostQuery::KittyGraphics(_) => Vec::new(),
         }
     }
 
