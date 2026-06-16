@@ -7,15 +7,18 @@
 //! `Perform::apc_dispatch`; `Grid::apc_dispatch` strips the leading `G` and hands
 //! the remainder here.
 //!
-//! Phase 1a (this file): parse the control keys and classify a command into a
-//! [`KittyOutcome`] — a support *query* (`a=q`), a *store* command
-//! (transmit/display/place), or *ignore*. Storage, anchoring, and rendering land
-//! in later phases. See `GOAL-kitty-graphics.md` and `KITTY_GRAPHICS_PLAN.md`.
+//! - Phase 1a: classify a command into a [`KittyOutcome`] (query / store / ignore).
+//! - Phase 1b (this file): typed control-key parsing ([`KittyControl`]),
+//!   dimension extraction without a full decode ([`image_dimensions`]), and
+//!   multi-chunk (`m=1`) reassembly ([`PendingUpload`]).
+//!
+//! Storage/anchoring (wiring the reassembler into the Grid) and rendering land in
+//! Phases 1c+. See `GOAL-kitty-graphics.md` and `KITTY_GRAPHICS_PLAN.md`.
 
 use std::collections::HashMap;
 
-/// The classification of a parsed Kitty graphics command, as far as Phase 1a
-/// cares. The Grid acts on this without re-parsing.
+/// The classification of a parsed Kitty graphics command, as far as the Grid
+/// boundary cares. The Grid acts on this without re-parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KittyOutcome {
     /// `a=q` — a support probe / capability query. Answered locally (zellij
@@ -23,7 +26,8 @@ pub enum KittyOutcome {
     /// bytes via the host-query pause/replay machinery. Stores nothing.
     Query(KittyQuery),
     /// `a=t` / `a=T` / `a=p` — transmit / transmit+display / place. Carries the
-    /// parsed control keys and the (still base64) payload for later phases.
+    /// typed control and the (still base64) payload of *this chunk*; the Grid
+    /// feeds it to a [`PendingUpload`] for `m=1` reassembly (Phase 1c).
     Store(KittyCommand),
     /// Anything not handled in Phase 1 (delete `a=d`, unknown actions, SOS/PM
     /// payloads that slipped past the `G` gate, malformed input).
@@ -42,14 +46,88 @@ pub struct KittyQuery {
     pub quiet: u8,
 }
 
-/// A transmit/display/place command. Phase 1a keeps the raw single-char control
-/// keys plus the undecoded payload; richer typed fields are added in Phase 1b.
+/// One transmit/display/place command chunk: its typed control plus the
+/// undecoded (base64) payload bytes of this chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KittyCommand {
-    /// Single-character control keys (`a`, `i`, `f`, `s`, `v`, `m`, …) → value.
-    pub keys: HashMap<char, String>,
+    pub control: KittyControl,
     /// Bytes after the `;` separator (base64, not yet decoded).
     pub payload: Vec<u8>,
+}
+
+/// The action requested by the `a=` control key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KittyAction {
+    /// `t` — transmit only. The default when `a=` is absent.
+    Transmit,
+    /// `T` — transmit and display.
+    TransmitAndDisplay,
+    /// `p` — put (place an already-transmitted image).
+    Place,
+    /// `d` — delete.
+    Delete,
+    /// `q` — query / capability probe.
+    Query,
+    /// An action key we do not recognise.
+    Unknown,
+}
+
+/// Pixel format of the transmitted data (`f=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KittyFormat {
+    /// `f=24` — packed RGB.
+    Rgb,
+    /// `f=32` — packed RGBA. The Kitty default when `f=` is absent.
+    Rgba,
+    /// `f=100` — PNG.
+    Png,
+}
+
+/// Transmission medium (`t=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KittyMedium {
+    /// `t=d` — direct: base64 payload inline. The default, and the only medium
+    /// supported in v1.
+    Direct,
+    /// `t=f` — a regular file path.
+    File,
+    /// `t=t` — a temporary file path.
+    TempFile,
+    /// `t=s` — a POSIX shared-memory object.
+    SharedMemory,
+}
+
+/// Typed view of the Kitty control keys this implementation cares about.
+/// Unknown keys are ignored (forward-compatible).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyControl {
+    pub action: KittyAction,
+    pub format: KittyFormat,
+    pub medium: KittyMedium,
+    /// `i=` app-chosen image id.
+    pub image_id: Option<u32>,
+    /// `I=` image number.
+    pub image_number: Option<u32>,
+    /// `p=` placement id.
+    pub placement_id: Option<u32>,
+    /// `m=1` — more chunks follow.
+    pub more: bool,
+    /// `s=` source width in px (raw formats).
+    pub src_width: Option<u32>,
+    /// `v=` source height in px (raw formats).
+    pub src_height: Option<u32>,
+    /// `o=z` — payload is zlib-compressed.
+    pub compressed: bool,
+    /// `q=` quiet level.
+    pub quiet: u8,
+}
+
+impl KittyControl {
+    /// Whether v1 can handle this command's transmission medium and format.
+    /// v1 supports only direct (`t=d`) transmission; `t=f`/`t=s` are placeholders.
+    pub fn medium_supported(&self) -> bool {
+        matches!(self.medium, KittyMedium::Direct)
+    }
 }
 
 impl KittyQuery {
@@ -82,26 +160,25 @@ pub fn dispatch(body: &[u8]) -> KittyOutcome {
         Some(i) => (&body[..i], body[i + 1..].to_vec()),
         None => (body, Vec::new()),
     };
-    let keys = parse_keys(keys_bytes);
+    let control = parse_control(&parse_keys(keys_bytes));
 
-    // Kitty's default action when `a` is absent is transmit (`t`).
-    let action = keys.get(&'a').map(String::as_str).unwrap_or("t");
-
-    match action {
-        "q" => KittyOutcome::Query(KittyQuery {
-            id: keys.get(&'i').and_then(|v| v.parse().ok()),
-            image_number: keys.get(&'I').and_then(|v| v.parse().ok()),
-            quiet: keys.get(&'q').and_then(|v| v.parse().ok()).unwrap_or(0),
+    match control.action {
+        KittyAction::Query => KittyOutcome::Query(KittyQuery {
+            id: control.image_id,
+            image_number: control.image_number,
+            quiet: control.quiet,
         }),
-        "t" | "T" | "p" => KittyOutcome::Store(KittyCommand { keys, payload }),
+        KittyAction::Transmit | KittyAction::TransmitAndDisplay | KittyAction::Place => {
+            KittyOutcome::Store(KittyCommand { control, payload })
+        },
         // `d` (delete) and unknown actions are handled in later phases.
-        _ => KittyOutcome::Ignore,
+        KittyAction::Delete | KittyAction::Unknown => KittyOutcome::Ignore,
     }
 }
 
 /// Parse a comma-separated list of `k=v` control keys. Keys are single ASCII
 /// characters; unknown or malformed entries are skipped (forward-compatible).
-fn parse_keys(bytes: &[u8]) -> HashMap<char, String> {
+pub fn parse_keys(bytes: &[u8]) -> HashMap<char, String> {
     let mut keys = HashMap::new();
     if bytes.is_empty() {
         return keys;
@@ -122,9 +199,154 @@ fn parse_keys(bytes: &[u8]) -> HashMap<char, String> {
     keys
 }
 
+/// Build a typed [`KittyControl`] from raw control keys. Absent keys take Kitty
+/// defaults (action `t`, format RGBA, medium direct).
+pub fn parse_control(keys: &HashMap<char, String>) -> KittyControl {
+    let num = |k: char| keys.get(&k).and_then(|v| v.parse::<u32>().ok());
+
+    let action = match keys.get(&'a').map(String::as_str) {
+        None | Some("t") => KittyAction::Transmit,
+        Some("T") => KittyAction::TransmitAndDisplay,
+        Some("p") => KittyAction::Place,
+        Some("d") => KittyAction::Delete,
+        Some("q") => KittyAction::Query,
+        Some(_) => KittyAction::Unknown,
+    };
+    let format = match keys.get(&'f').map(String::as_str) {
+        Some("24") => KittyFormat::Rgb,
+        Some("100") => KittyFormat::Png,
+        // Kitty default is f=32 (RGBA).
+        _ => KittyFormat::Rgba,
+    };
+    let medium = match keys.get(&'t').map(String::as_str) {
+        Some("f") => KittyMedium::File,
+        Some("t") => KittyMedium::TempFile,
+        Some("s") => KittyMedium::SharedMemory,
+        // Kitty default is t=d (direct).
+        _ => KittyMedium::Direct,
+    };
+
+    KittyControl {
+        action,
+        format,
+        medium,
+        image_id: num('i'),
+        image_number: num('I'),
+        placement_id: num('p'),
+        more: keys.get(&'m').map(String::as_str) == Some("1"),
+        src_width: num('s'),
+        src_height: num('v'),
+        compressed: keys.get(&'o').map(String::as_str) == Some("z"),
+        quiet: keys.get(&'q').and_then(|v| v.parse().ok()).unwrap_or(0),
+    }
+}
+
+/// Decode a base64 payload, tolerating no embedded whitespace (Kitty chunks are
+/// raw base64). Returns `None` on malformed input.
+pub fn decode_payload(b64: &[u8]) -> Option<Vec<u8>> {
+    base64::decode(b64).ok()
+}
+
+/// Determine the image's pixel dimensions without a full pixel decode.
+///
+/// - raw formats (`f=24`/`f=32`): from the `s`,`v` control keys;
+/// - PNG (`f=100`): from the IHDR header of the decoded payload;
+/// - `o=z` (zlib) without `s`,`v`: not recoverable without inflate (no zlib
+///   decoder is currently vendored), so returns `None` → caller placeholders.
+///   TODO(Phase 1b follow-up): inflate just enough to read the PNG IHDR.
+pub fn image_dimensions(control: &KittyControl, decoded_payload: &[u8]) -> Option<(u32, u32)> {
+    if let (Some(w), Some(h)) = (control.src_width, control.src_height) {
+        return Some((w, h));
+    }
+    if control.compressed {
+        return None;
+    }
+    match control.format {
+        KittyFormat::Png => png_dimensions(decoded_payload),
+        // Raw RGB/RGBA carry no header; dimensions must come from s,v.
+        KittyFormat::Rgb | KittyFormat::Rgba => None,
+    }
+}
+
+/// Read width/height from a PNG IHDR. Layout: 8-byte signature, then the IHDR
+/// chunk `len(4) "IHDR"(4) width(4) height(4) …` — width at byte 16, height at
+/// byte 20, both big-endian.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) {
+        return None;
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((w, h))
+}
+
+/// A finalized image, ready for the store (Phase 1c). The base64 payload is kept
+/// undecoded so it can be re-transmitted to the outer terminal verbatim
+/// (Phase 3), including when `o=z`-compressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedImage {
+    pub control: KittyControl,
+    pub payload_b64: Vec<u8>,
+    pub dimensions: Option<(u32, u32)>,
+}
+
+/// Accumulates a multi-chunk (`m=1`) Kitty upload. Kitty requires a single
+/// active graphics upload to finish before any other graphics command; only the
+/// first chunk carries the control keys (format/dims/id), continuation chunks
+/// carry just `m` (and maybe `q`). The Grid owns one `Option<PendingUpload>`
+/// (Phase 1c); a support query (`a=q`) that arrives mid-upload must NOT disturb
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpload {
+    /// Control from the FIRST chunk (continuation chunks' control is ignored
+    /// except for the `more` flag, tracked separately on append).
+    control: KittyControl,
+    /// Accumulated base64 payload across all chunks so far.
+    payload_b64: Vec<u8>,
+}
+
+impl PendingUpload {
+    /// Begin an upload from its first chunk.
+    pub fn begin(control: KittyControl, first_chunk_b64: &[u8]) -> Self {
+        PendingUpload {
+            control,
+            payload_b64: first_chunk_b64.to_vec(),
+        }
+    }
+
+    /// Append a continuation chunk's base64 payload.
+    pub fn append(&mut self, chunk_b64: &[u8]) {
+        self.payload_b64.extend_from_slice(chunk_b64);
+    }
+
+    /// The image id (`i`) this upload addresses, if any.
+    pub fn image_id(&self) -> Option<u32> {
+        self.control.image_id
+    }
+
+    /// Finalize the upload, computing dimensions from control + decoded payload.
+    pub fn finish(self) -> FinishedImage {
+        let dimensions = match decode_payload(&self.payload_b64) {
+            Some(decoded) => image_dimensions(&self.control, &decoded),
+            // If the base64 itself is malformed we can still anchor from s,v.
+            None => image_dimensions(&self.control, &[]),
+        };
+        FinishedImage {
+            control: self.control,
+            payload_b64: self.payload_b64,
+            dimensions,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control_of(body: &[u8]) -> KittyControl {
+        parse_control(&parse_keys(body))
+    }
 
     #[test]
     fn query_is_classified() {
@@ -154,11 +376,12 @@ mod tests {
     }
 
     #[test]
-    fn transmit_and_display_is_store() {
-        let out = dispatch(b"a=T,f=100,i=1;iVBORw0KGgo=");
-        match out {
+    fn transmit_and_display_is_store_with_typed_control() {
+        match dispatch(b"a=T,f=100,i=1;iVBORw0KGgo=") {
             KittyOutcome::Store(cmd) => {
-                assert_eq!(cmd.keys.get(&'f').map(String::as_str), Some("100"));
+                assert_eq!(cmd.control.action, KittyAction::TransmitAndDisplay);
+                assert_eq!(cmd.control.format, KittyFormat::Png);
+                assert_eq!(cmd.control.image_id, Some(1));
                 assert_eq!(cmd.payload, b"iVBORw0KGgo=".to_vec());
             },
             other => panic!("expected Store, got {:?}", other),
@@ -166,9 +389,20 @@ mod tests {
     }
 
     #[test]
-    fn absent_action_defaults_to_transmit_store() {
-        // No `a=` key → default transmit → Store.
-        assert!(matches!(dispatch(b"f=24,s=1,v=1;AAAA"), KittyOutcome::Store(_)));
+    fn defaults_when_keys_absent() {
+        let c = control_of(b"i=5");
+        assert_eq!(c.action, KittyAction::Transmit); // default a=t
+        assert_eq!(c.format, KittyFormat::Rgba); // default f=32
+        assert_eq!(c.medium, KittyMedium::Direct); // default t=d
+        assert!(!c.more);
+        assert!(c.medium_supported());
+    }
+
+    #[test]
+    fn unsupported_media_flagged() {
+        assert!(!control_of(b"a=t,t=f").medium_supported());
+        assert!(!control_of(b"a=t,t=s").medium_supported());
+        assert_eq!(control_of(b"a=t,t=f").medium, KittyMedium::File);
     }
 
     #[test]
@@ -179,7 +413,6 @@ mod tests {
 
     #[test]
     fn malformed_keys_skipped() {
-        // `a=q` survives even with junk keys around it.
         let out = dispatch(b"a=q,,=,xx=1,i=5");
         assert_eq!(
             out,
@@ -201,5 +434,62 @@ mod tests {
 
         let quiet = KittyQuery { id: Some(1), image_number: None, quiet: 1 };
         assert_eq!(quiet.ok_reply(), None);
+    }
+
+    #[test]
+    fn raw_dimensions_from_s_v() {
+        let c = control_of(b"a=t,f=32,s=64,v=48");
+        assert_eq!(image_dimensions(&c, &[]), Some((64, 48)));
+    }
+
+    #[test]
+    fn png_dimensions_from_ihdr() {
+        // Minimal PNG header: signature + IHDR len + "IHDR" + width(5) + height(7)
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&5u32.to_be_bytes());
+        png.extend_from_slice(&7u32.to_be_bytes());
+        let c = control_of(b"a=t,f=100");
+        assert_eq!(image_dimensions(&c, &png), Some((5, 7)));
+    }
+
+    #[test]
+    fn compressed_without_dims_is_unknown() {
+        // o=z PNG without s,v: not recoverable without inflate → None (placeholder).
+        let c = control_of(b"a=t,f=100,o=z");
+        assert!(c.compressed);
+        assert_eq!(image_dimensions(&c, b"\x89PNG\r\n\x1a\n............"), None);
+        // …but explicit s,v win even when compressed.
+        let c2 = control_of(b"a=t,f=100,o=z,s=10,v=20");
+        assert_eq!(image_dimensions(&c2, &[]), Some((10, 20)));
+    }
+
+    #[test]
+    fn reassembly_concatenates_chunks_and_finishes() {
+        // "AAAA" base64-decodes to 3 zero bytes; split across two chunks.
+        let first = control_of(b"a=t,f=32,s=1,v=1,m=1");
+        let mut upload = PendingUpload::begin(first, b"AA");
+        upload.append(b"AA");
+        let finished = upload.finish();
+        assert_eq!(finished.payload_b64, b"AAAA".to_vec());
+        assert_eq!(finished.dimensions, Some((1, 1)));
+    }
+
+    #[test]
+    fn reassembly_png_dims_after_full_decode() {
+        // base64 of a minimal PNG header, transmitted whole.
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&3u32.to_be_bytes());
+        png.extend_from_slice(&4u32.to_be_bytes());
+        let b64 = base64::encode(&png);
+        let upload = PendingUpload::begin(control_of(b"a=T,f=100,i=1"), b64.as_bytes());
+        let finished = upload.finish();
+        assert_eq!(finished.dimensions, Some((3, 4)));
+        assert_eq!(finished.control.image_id, Some(1));
     }
 }

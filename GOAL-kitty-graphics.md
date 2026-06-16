@@ -65,19 +65,28 @@ downstream consumes them yet.
   ignored; `a=T` transmit does not enrol). `cargo check -p zellij-server` clean;
   no regression in existing forwarded-query / `csi_996n` tests.
 
-### 1b. Protocol parsing & reassembly (`kitty.rs`)
-- [ ] Parse control keys: `a,i,I,p,f,t,m,s,v,c,r,x,y,w,h,z,o,q` (ignore unknown).
-  v1 medium: `t=d` only; placeholder/error `t=f`/`t=s`.
-- [ ] Multi-chunk `m=1` reassembly in a single active-upload state (only first
-  chunk carries dims/format; finalize on `m=0`/absent; use final chunk's cursor).
-- [ ] `a=q` mid-upload must **not** disturb the `m=1` accumulator.
-- [ ] Dimensions without decode: `s,v` for raw; PNG IHDR for `f=100`. **`o=z`
-  without `s,v`:** inflate just enough zlib to read IHDR; else placeholder.
-  (Spec §3a.)
-- [ ] `I` image-number → allocate a zellij-local id, reply
-  `i=<alloc>,I=<number>;OK` via the same synthesize+pause path (can block).
-- [ ] **Tests:** key parse; multi-chunk reassembly; `o=z` dim paths; `a=q`
-  mid-upload leaves accumulator intact.
+### 1b. Protocol parsing & reassembly (`kitty.rs`) — mostly DONE
+- [x] Typed control parse (`KittyControl`): `a,i,I,p,f,t,m,s,v,o,q` with Kitty
+  defaults (a=t, f=32, t=d). `c,r,x,y,w,h,z` deferred to Phase 3 (placement/crop,
+  where they're consumed). `medium_supported()` flags `t=f`/`t=s` (placeholdered).
+- [x] `PendingUpload` reassembler: `begin`/`append`/`finish` concatenates `m=1`
+  chunks; first chunk carries control. **State ownership (Grid holds
+  `Option<PendingUpload>`) + final-chunk cursor → Phase 1c** (needs the Grid/store).
+- [x] Dimensions without full decode (`image_dimensions`): `s,v` for raw; PNG
+  IHDR for `f=100`. **`o=z` without `s,v` → `None` (placeholder).** Inflate-IHDR
+  deferred — needs a zlib dep (no `flate2` vendored); see decision note below.
+- [ ] `a=q` mid-upload must not disturb the accumulator — trivially holds today
+  (Query never touches the upload); **re-assert once the Grid owns the
+  accumulator in 1c.**
+- [ ] `I` image-number → allocate a zellij-local id + reply — **deferred to 1c**
+  (needs an id-allocation table on the store/Screen).
+- [x] **Tests (13 green):** typed parse + defaults; unsupported media; raw `s,v`
+  + PNG IHDR + `o=z` dim paths; multi-chunk reassembly (raw + PNG).
+
+> **Decision needed (non-blocking):** `o=z` (zlib-compressed) images without
+> explicit `s,v` currently placeholder. Recovering their dimensions needs a zlib
+> inflater (`flate2`/`miniz_oxide`), a new dependency. Deferred until it's worth
+> adding — most real payloads carry `s,v` or are uncompressed PNG.
 
 ### 1c. Storage & anchoring
 - [ ] `KittyImageStore` (`HashMap<u32, KittyImage{format,payload,px_w,px_h}>`),
