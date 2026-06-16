@@ -257,6 +257,86 @@ fn kitty_deletion_emits_delete_to_supporting_client() {
 }
 
 #[test]
+fn kitty_placement_cropped_by_watcher_size_is_reconciled_stale() {
+    // Regression: `serialize_with_size` must reconcile against the chunks it
+    // actually emitted after `max_size` filtering. A placement that moves
+    // outside a watcher's smaller bounds is skipped during output; if the
+    // reconciliation frame were built from the unfiltered chunk list it would
+    // still be recorded as live, suppressing its delete and ghosting a
+    // cropped-out image on the outer terminal.
+    use crate::output::KittyImageChunk;
+    // The persistent render state (transmit-once + live placement tracking) is
+    // shared across renders via an Rc; `Output` itself is rebuilt each frame.
+    let kitty_render_state = Rc::new(RefCell::new(
+        crate::panes::kitty::KittyRenderState::default(),
+    ));
+    let new_frame_output = || {
+        Output::new(
+            Rc::new(RefCell::new(SixelImageStore::default())),
+            Rc::new(RefCell::new(Some(SizeInPixels { height: 20, width: 10 }))),
+            true,
+            true,
+            kitty_render_state.clone(),
+        )
+    };
+
+    let make_chunk = |cell_y: usize| KittyImageChunk {
+        cell_x: 0,
+        cell_y,
+        source_image_id: 7,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 4,
+        full_height: 4,
+        src_x: 0,
+        src_y: 0,
+        src_width: 4,
+        src_height: 4,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    // Watcher only sees rows 0..5.
+    let max_size = Some(Size { rows: 5, cols: 80 });
+
+    // Frame 1: placement at row 0 is inside the watcher bounds -> emitted + live.
+    let mut output = new_frame_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+    output.add_kitty_image_chunks_to_client(1, vec![make_chunk(0)], None);
+    let f1 = output.serialize_with_size(max_size, None).unwrap();
+    let c1 = f1.get(&1).cloned().unwrap_or_default();
+    assert!(c1.contains("a=p,q=2"), "frame 1 places the image: {:?}", c1);
+    assert!(!c1.contains("a=d"), "frame 1 has nothing stale to delete: {:?}", c1);
+
+    // Frame 2: the same placement moves to row 10, outside the watcher bounds.
+    // It is skipped during output; reconciliation must still delete it.
+    let mut output = new_frame_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+    output.add_kitty_image_chunks_to_client(1, vec![make_chunk(10)], None);
+    let f2 = output.serialize_with_size(max_size, None).unwrap();
+    let c2 = f2.get(&1).cloned().unwrap_or_default();
+    assert!(
+        !c2.contains("a=p,q=2"),
+        "frame 2 does not re-place the cropped-out image: {:?}",
+        c2
+    );
+    assert!(
+        c2.contains("a=d,d=i,q=2") && c2.contains("p=1"),
+        "cropped-out placement is deleted, not ghosted: {:?}",
+        c2
+    );
+}
+
+#[test]
 fn test_is_dirty_with_pre_vte_instructions() {
     let mut output = create_test_output();
     let client_ids = create_test_clients(1);

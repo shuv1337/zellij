@@ -194,23 +194,6 @@ fn serialize_chunks_with_newlines(
     }
     Ok(vte_output)
 }
-/// Group a client's visible Kitty chunks into `source image id → set of
-/// placement ids` for placement reconciliation.
-fn kitty_frame_placements(
-    chunks: Option<&Vec<KittyImageChunk>>,
-) -> HashMap<u32, HashSet<u32>> {
-    let mut frame: HashMap<u32, HashSet<u32>> = HashMap::new();
-    if let Some(chunks) = chunks {
-        for chunk in chunks {
-            frame
-                .entry(chunk.source_image_id)
-                .or_default()
-                .insert(chunk.placement_id);
-        }
-    }
-    frame
-}
-
 fn serialize_chunks(
     character_chunks: Vec<CharacterChunk>,
     sixel_chunks: Option<&Vec<SixelImageChunk>>,
@@ -223,7 +206,7 @@ fn serialize_chunks(
     // outer terminal supports Kitty. `None` render-state => gate to placeholder.
     kitty_chunks: Option<&Vec<KittyImageChunk>>,
     kitty_render: Option<(&mut crate::panes::kitty::KittyRenderState, u16)>,
-) -> Result<String> {
+) -> Result<SerializedChunks> {
     let err_context = || "failed to serialize input chunks".to_string();
 
     let mut vte_output = String::new();
@@ -310,6 +293,14 @@ fn serialize_chunks(
     // Kitty graphics: emit transmit-once + placement per visible chunk, gated on
     // per-client outer-terminal support. Appended to the same image-vte block as
     // sixel so it inherits the post-text z-order (images above text).
+    //
+    // `emitted_frame` records exactly the (source image -> placement ids) that
+    // survive `max_size` filtering here, so the caller reconciles against what
+    // was actually rendered. Building it from the unfiltered `kitty_chunks`
+    // would leave a placement cropped out by a watcher's smaller `max_size`
+    // recorded as live, suppressing its delete and ghosting it on the outer
+    // terminal.
+    let mut emitted_frame: HashMap<u32, HashSet<u32>> = HashMap::new();
     if let (Some(kitty_chunks), Some((render_state, client_id))) = (kitty_chunks, kitty_render) {
         for chunk in kitty_chunks {
             if let Some(size) = max_size {
@@ -317,6 +308,10 @@ fn serialize_chunks(
                     continue;
                 }
             }
+            emitted_frame
+                .entry(chunk.source_image_id)
+                .or_default()
+                .insert(chunk.placement_id);
             let image_vte = sixel_vte.get_or_insert_with(String::new);
             vte_goto_instruction(chunk.cell_x, chunk.cell_y, image_vte)
                 .with_context(err_context)?;
@@ -347,7 +342,20 @@ fn serialize_chunks(
         vte_output.push_str(sixel_vte);
         vte_output.push_str(restore_cursor_position);
     }
-    Ok(vte_output)
+    Ok(SerializedChunks {
+        vte_output,
+        kitty_frame: emitted_frame,
+    })
+}
+
+/// Result of [`serialize_chunks`]: the serialized VTE bytes plus the Kitty
+/// placement frame (source image id -> placement ids) that was actually emitted
+/// after `max_size` filtering. The caller feeds `kitty_frame` to
+/// `KittyRenderState::reconcile_placements` so stale placements are deleted from
+/// the outer terminal.
+struct SerializedChunks {
+    vte_output: String,
+    kitty_frame: HashMap<u32, HashSet<u32>>,
 }
 
 type AbsoluteMiddleStart = usize;
@@ -687,25 +695,25 @@ impl Output {
             } else {
                 None
             };
-            client_serialized_render_instructions.push_str(
-                &serialize_chunks(
-                    client_character_chunks,
-                    self.sixel_chunks.get(&client_id),
-                    self.link_handler.as_mut(),
-                    Some(&mut self.sixel_image_store.borrow_mut()),
-                    self.styled_underlines,
-                    self.osc8_hyperlinks,
-                    None, // No size constraints for regular rendering
-                    self.kitty_chunks.get(&client_id),
-                    kitty_render,
-                )
-                .with_context(err_context)?,
-            ); // TODO: less allocations?
+            let serialized = serialize_chunks(
+                client_character_chunks,
+                self.sixel_chunks.get(&client_id),
+                self.link_handler.as_mut(),
+                Some(&mut self.sixel_image_store.borrow_mut()),
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                None, // No size constraints for regular rendering
+                self.kitty_chunks.get(&client_id),
+                kitty_render,
+            )
+            .with_context(err_context)?;
+            client_serialized_render_instructions.push_str(&serialized.vte_output); // TODO: less allocations?
             // Reconcile placements: delete any that were live last frame but are
             // gone now (coverage grew / scrolled out), so they don't ghost.
+            // Reconcile against the frame that was actually emitted (post-filter).
             if kitty_supported {
-                let frame = kitty_frame_placements(self.kitty_chunks.get(&client_id));
-                let stale = kitty_state.reconcile_placements(client_id, &frame);
+                let stale =
+                    kitty_state.reconcile_placements(client_id, &serialized.kitty_frame);
                 if !stale.is_empty() {
                     client_serialized_render_instructions
                         .push_str(&String::from_utf8_lossy(&stale));
@@ -794,23 +802,25 @@ impl Output {
             } else {
                 None
             };
-            client_serialized_render_instructions.push_str(
-                &serialize_chunks(
-                    client_character_chunks,
-                    self.sixel_chunks.get(&client_id),
-                    self.link_handler.as_mut(),
-                    Some(&mut self.sixel_image_store.borrow_mut()),
-                    self.styled_underlines,
-                    self.osc8_hyperlinks,
-                    max_size,
-                    self.kitty_chunks.get(&client_id),
-                    kitty_render,
-                )
-                .with_context(err_context)?,
-            );
+            let serialized = serialize_chunks(
+                client_character_chunks,
+                self.sixel_chunks.get(&client_id),
+                self.link_handler.as_mut(),
+                Some(&mut self.sixel_image_store.borrow_mut()),
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                max_size,
+                self.kitty_chunks.get(&client_id),
+                kitty_render,
+            )
+            .with_context(err_context)?;
+            client_serialized_render_instructions.push_str(&serialized.vte_output);
+            // Reconcile against the frame that was actually emitted (post-`max_size`
+            // filter), so a placement cropped out by a watcher's smaller size is
+            // deleted from the outer terminal instead of ghosting.
             if kitty_supported {
-                let frame = kitty_frame_placements(self.kitty_chunks.get(&client_id));
-                let stale = kitty_state.reconcile_placements(client_id, &frame);
+                let stale =
+                    kitty_state.reconcile_placements(client_id, &serialized.kitty_frame);
                 if !stale.is_empty() {
                     client_serialized_render_instructions
                         .push_str(&String::from_utf8_lossy(&stale));
