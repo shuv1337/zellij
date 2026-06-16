@@ -17,7 +17,7 @@
 
 use super::sixel::PixelRect;
 use crate::output::KittyImageChunk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use zellij_utils::pane_size::SizeInPixels;
 
 /// The classification of a parsed Kitty graphics command, as far as the Grid
@@ -691,6 +691,10 @@ pub struct KittyRenderState {
     outer_ids: HashMap<(u16, u32), u32>,
     /// Outer ids already transmitted to each client's terminal.
     transmitted: HashMap<(u16, u32), bool>,
+    /// Placement ids currently live in each client's outer terminal, per source
+    /// image — so stale placements (when coverage/scroll reduces the visible
+    /// sub-rects) can be deleted rather than lingering as ghosts.
+    placements: HashMap<(u16, u32), HashSet<u32>>,
     /// Next outer id to hand out (allocated from a high base).
     next_outer_id: u32,
 }
@@ -700,6 +704,7 @@ impl Default for KittyRenderState {
         KittyRenderState {
             outer_ids: HashMap::new(),
             transmitted: HashMap::new(),
+            placements: HashMap::new(),
             // High base: keep zellij's outer ids clear of low app-chosen ids.
             next_outer_id: 0x9000_0000,
         }
@@ -724,6 +729,7 @@ impl KittyRenderState {
     pub fn reset_client(&mut self, client_id: u16) {
         self.outer_ids.retain(|(c, _), _| *c != client_id);
         self.transmitted.retain(|(c, _), _| *c != client_id);
+        self.placements.retain(|(c, _), _| *c != client_id);
     }
 
     /// Forget a source image across all clients (on reap / delete). Returns the
@@ -739,6 +745,8 @@ impl KittyRenderState {
             }
         });
         self.transmitted
+            .retain(|(_, src), _| *src != source_image_id);
+        self.placements
             .retain(|(_, src), _| *src != source_image_id);
         deleted
     }
@@ -785,7 +793,50 @@ impl KittyRenderState {
     /// transmitted flag. Used to emit a delete and forget the mapping.
     pub fn take_outer_id(&mut self, client_id: u16, source_image_id: u32) -> Option<u32> {
         self.transmitted.remove(&(client_id, source_image_id));
+        self.placements.remove(&(client_id, source_image_id));
         self.outer_ids.remove(&(client_id, source_image_id))
+    }
+
+    /// Reconcile this frame's placements for `client_id` against what is live in
+    /// the outer terminal: delete any placement id (per source image) that was
+    /// placed last frame but is absent now (coverage grew, or the image scrolled
+    /// partly out), then record the new live set. Returns the delete bytes.
+    pub fn reconcile_placements(
+        &mut self,
+        client_id: u16,
+        frame: &HashMap<u32, HashSet<u32>>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let tracked: Vec<(u16, u32)> = self
+            .placements
+            .keys()
+            .filter(|(c, _)| *c == client_id)
+            .copied()
+            .collect();
+        for key @ (_, source_id) in tracked {
+            let now = frame.get(&source_id);
+            if let Some(outer_id) = self.outer_ids.get(&key).copied() {
+                if let Some(prev) = self.placements.get(&key) {
+                    for pid in prev {
+                        let still_live = now.map(|s| s.contains(pid)).unwrap_or(false);
+                        if !still_live {
+                            out.extend_from_slice(
+                                format!("\x1b_Ga=d,d=i,q=2,i={},p={}\x1b\\", outer_id, pid)
+                                    .as_bytes(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Record this frame's live placements (drop keys no longer present).
+        self.placements.retain(|(c, _), _| *c != client_id);
+        for (source_id, pids) in frame {
+            if !pids.is_empty() {
+                self.placements.insert((client_id, *source_id), pids.clone());
+            }
+        }
+        out
     }
 
     /// Emit a delete of a source image's placements/data on a client.
@@ -1150,6 +1201,31 @@ mod tests {
     fn delete_image_bytes_well_formed() {
         let bytes = String::from_utf8(KittyRenderState::delete_image_bytes(0x90000000)).unwrap();
         assert_eq!(bytes, "\x1b_Ga=d,d=i,q=2,i=2415919104\x1b\\");
+    }
+
+    #[test]
+    fn reconcile_deletes_stale_placements() {
+        let mut rs = KittyRenderState::default();
+        // Allocate an outer id for (client 1, image 7).
+        rs.render_chunk_bytes(1, &spec());
+
+        // Frame 1: image 7 shows two visible sub-rects (placements 1 and 2).
+        let mut f1: HashMap<u32, HashSet<u32>> = HashMap::new();
+        f1.insert(7, HashSet::from([1, 2]));
+        assert!(
+            rs.reconcile_placements(1, &f1).is_empty(),
+            "nothing tracked yet → nothing to delete"
+        );
+
+        // Frame 2: coverage grew, only placement 1 remains → placement 2 deleted.
+        let mut f2: HashMap<u32, HashSet<u32>> = HashMap::new();
+        f2.insert(7, HashSet::from([1]));
+        let deletes = String::from_utf8(rs.reconcile_placements(1, &f2)).unwrap();
+        assert!(deletes.contains("a=d,d=i") && deletes.contains("p=2"), "stale p=2 deleted: {}", deletes);
+        assert!(!deletes.contains("p=1"), "live placement p=1 kept");
+
+        // Frame 3: unchanged → no further deletes.
+        assert!(rs.reconcile_placements(1, &f2).is_empty());
     }
 
     // --- Phase 4: delete / lifecycle ---

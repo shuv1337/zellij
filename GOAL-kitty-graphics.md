@@ -206,13 +206,20 @@ and anchored; no rendering yet. `cargo check -p zellij-server -p zellij-client
   `outer_supports_kitty[client]`; otherwise nothing emitted. (Sixel-source and a
   visible placeholder glyph remain future polish — currently unsupported clients
   simply render no image.)
-- [ ] **Deferred:** per-source-image base64 cache; floating-pane coverage
-  *splitting* (`remove_covered_sixel_parts`) — v1 emits one placement per image,
-  clipped to the viewport but not split around covering panes.
+- [x] **Floating-pane occlusion** (PR review round 2): `add_kitty_image_chunks_to_client`
+  now clips chunks through `FloatingPanesStack::visible_kitty_image_chunks`
+  (reuses the tested `remove_covered_sixel_parts` splitting via chunk conversion),
+  emitting a placement per visible sub-rect. `KittyRenderState::reconcile_placements`
+  deletes placements that were live last frame but gone now (coverage grew /
+  scrolled out), so no ghosts.
+- [x] **Render-gate dirty-tracking** (PR review round 2): `Output::is_dirty` and
+  `has_rendered_assets` now count `kitty_chunks` + `kitty_deletions`, so a
+  Kitty-only placement update or `a=d` is never dropped by the serialize gate.
+- [ ] **Deferred:** per-source-image base64 cache.
 - [x] **Tests:** `KittyRenderState` transmit-once / per-client ids / reset /
-  raw-dims / delete bytes (7); `visible_kitty_chunks` via anchoring tests; output
-  integration `kitty_chunks_emitted_only_to_supporting_clients` (gating). Full
-  server lib suite green (1202).
+  raw-dims / delete bytes / reconcile-stale-placements; `visible_kitty_chunks`
+  anchoring; occlusion drop/passthrough; Kitty-only dirty-tracking; output gating.
+  Full server lib suite green (1218).
 
 > **NEEDS HARDWARE:** that the emitted sequences actually *display* the image
 > correctly (position, scroll crop, no flicker on re-emit) is verifiable only on

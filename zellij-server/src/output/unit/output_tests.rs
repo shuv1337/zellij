@@ -144,6 +144,75 @@ fn kitty_chunks_emitted_only_to_supporting_clients() {
     );
 }
 
+fn make_kitty_chunk(cell_x: usize, cell_y: usize, w: usize, h: usize) -> crate::output::KittyImageChunk {
+    crate::output::KittyImageChunk {
+        cell_x,
+        cell_y,
+        source_image_id: 1,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: w,
+        full_height: h,
+        src_x: 0,
+        src_y: 0,
+        src_width: w,
+        src_height: h,
+        payload_b64: b"AAAA".to_vec(),
+    }
+}
+
+#[test]
+fn kitty_chunk_fully_under_floating_pane_is_dropped() {
+    // A covered tiled-pane image must not draw over a floating pane.
+    let pane_geom = create_pane_geom(0, 0, 10, 10); // covers cols 0-9, rows 0-9
+    let stack = FloatingPanesStack {
+        layers: vec![pane_geom],
+    };
+    let cell = SizeInPixels { width: 10, height: 20 };
+    // One cell (10x20px) at cell (2,2) — fully inside the covering pane.
+    let chunk = make_kitty_chunk(2, 2, 10, 20);
+    let visible = stack.visible_kitty_image_chunks(vec![chunk], Some(0), &cell);
+    assert!(visible.is_empty(), "fully-covered Kitty chunk must be dropped");
+}
+
+#[test]
+fn kitty_chunk_not_covered_passes_through() {
+    let pane_geom = create_pane_geom(0, 0, 5, 5);
+    let stack = FloatingPanesStack {
+        layers: vec![pane_geom],
+    };
+    let cell = SizeInPixels { width: 10, height: 20 };
+    // A cell at (20,20) — well clear of the covering pane.
+    let chunk = make_kitty_chunk(20, 20, 10, 20);
+    let visible = stack.visible_kitty_image_chunks(vec![chunk], Some(0), &cell);
+    assert_eq!(visible.len(), 1, "uncovered Kitty chunk survives");
+    assert_eq!(visible[0].source_image_id, 1);
+}
+
+#[test]
+fn kitty_chunks_and_deletions_mark_output_dirty() {
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    assert!(!output.is_dirty(), "no assets yet");
+
+    output.add_kitty_image_chunks_to_client(1, vec![make_kitty_chunk(0, 0, 10, 20)], None);
+    assert!(output.is_dirty(), "a Kitty-only placement must mark the frame dirty");
+    assert!(output.has_rendered_assets());
+}
+
+#[test]
+fn kitty_deletion_only_marks_output_dirty() {
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    output.add_kitty_deletions_to_multiple_clients(vec![5], std::iter::once(1));
+    assert!(output.is_dirty(), "a Kitty-only a=d delete must mark the frame dirty");
+}
+
 #[test]
 fn kitty_deletion_emits_delete_to_supporting_client() {
     use crate::output::KittyImageChunk;

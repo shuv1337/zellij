@@ -194,6 +194,23 @@ fn serialize_chunks_with_newlines(
     }
     Ok(vte_output)
 }
+/// Group a client's visible Kitty chunks into `source image id → set of
+/// placement ids` for placement reconciliation.
+fn kitty_frame_placements(
+    chunks: Option<&Vec<KittyImageChunk>>,
+) -> HashMap<u32, HashSet<u32>> {
+    let mut frame: HashMap<u32, HashSet<u32>> = HashMap::new();
+    if let Some(chunks) = chunks {
+        for chunk in chunks {
+            frame
+                .entry(chunk.source_image_id)
+                .or_default()
+                .insert(chunk.placement_id);
+        }
+    }
+    frame
+}
+
 fn serialize_chunks(
     character_chunks: Vec<CharacterChunk>,
     sixel_chunks: Option<&Vec<SixelImageChunk>>,
@@ -437,13 +454,26 @@ impl Output {
         &mut self,
         client_id: ClientId,
         kitty_image_chunks: Vec<KittyImageChunk>,
-        _z_index: Option<usize>,
+        z_index: Option<usize>,
     ) {
         if kitty_image_chunks.is_empty() {
             return;
         }
+        // Clip around covering floating panes (mirrors the sixel path) so a
+        // covered tiled-pane image cannot draw over a floating pane.
+        let visible = if let (Some(stack), Some(cell_size)) = (
+            &self.floating_panes_stack,
+            *self.character_cell_size.borrow(),
+        ) {
+            stack.visible_kitty_image_chunks(kitty_image_chunks, z_index, &cell_size)
+        } else {
+            kitty_image_chunks
+        };
+        if visible.is_empty() {
+            return;
+        }
         let entry = self.kitty_chunks.entry(client_id).or_insert_with(Vec::new);
-        entry.extend(kitty_image_chunks);
+        entry.extend(visible);
     }
 
     pub fn add_kitty_image_chunks_to_multiple_clients(
@@ -671,6 +701,16 @@ impl Output {
                 )
                 .with_context(err_context)?,
             ); // TODO: less allocations?
+            // Reconcile placements: delete any that were live last frame but are
+            // gone now (coverage grew / scrolled out), so they don't ghost.
+            if kitty_supported {
+                let frame = kitty_frame_placements(self.kitty_chunks.get(&client_id));
+                let stale = kitty_state.reconcile_placements(client_id, &frame);
+                if !stale.is_empty() {
+                    client_serialized_render_instructions
+                        .push_str(&String::from_utf8_lossy(&stale));
+                }
+            }
             drop(kitty_state);
 
             // append post-vte instructions for this client
@@ -768,6 +808,14 @@ impl Output {
                 )
                 .with_context(err_context)?,
             );
+            if kitty_supported {
+                let frame = kitty_frame_placements(self.kitty_chunks.get(&client_id));
+                let stale = kitty_state.reconcile_placements(client_id, &frame);
+                if !stale.is_empty() {
+                    client_serialized_render_instructions
+                        .push_str(&String::from_utf8_lossy(&stale));
+                }
+            }
             drop(kitty_state);
 
             // append post-vte instructions for this client
@@ -799,11 +847,15 @@ impl Output {
             || !self.post_vte_instructions.is_empty()
             || self.client_character_chunks.values().any(|c| !c.is_empty())
             || self.sixel_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_deletions.values().any(|c| !c.is_empty())
     }
     pub fn has_rendered_assets(&self) -> bool {
         // pre_vte and post_vte are not considered rendered assets as they should not be visible
         self.client_character_chunks.values().any(|c| !c.is_empty())
             || self.sixel_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_deletions.values().any(|c| !c.is_empty())
     }
     pub fn cursor_is_visible(
         &mut self,
@@ -915,6 +967,54 @@ impl FloatingPanesStack {
             }
         }
         chunks_to_check
+    }
+
+    /// Clip Kitty image chunks around covering floating panes, mirroring
+    /// `visible_sixel_image_chunks`. The chunk geometry maps 1:1 onto a sixel
+    /// chunk (cell position + source crop), so we reuse the tested
+    /// `remove_covered_sixel_parts` splitting and map the visible sub-rects back
+    /// to Kitty chunks. Each surviving sub-rect becomes its own placement of the
+    /// same source image (distinct `placement_id`); stale placements left when
+    /// coverage shrinks are reconciled away in `serialize`.
+    pub fn visible_kitty_image_chunks(
+        &self,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        z_index: Option<usize>,
+        character_cell_size: &SizeInPixels,
+    ) -> Vec<KittyImageChunk> {
+        let mut out = Vec::new();
+        for original in kitty_image_chunks {
+            let as_sixel = SixelImageChunk {
+                cell_x: original.cell_x,
+                cell_y: original.cell_y,
+                sixel_image_pixel_x: original.src_x,
+                sixel_image_pixel_y: original.src_y,
+                sixel_image_pixel_width: original.src_width,
+                sixel_image_pixel_height: original.src_height,
+                sixel_image_id: 0, // unused; geometry only
+            };
+            let visible_parts =
+                self.visible_sixel_image_chunks(vec![as_sixel], z_index, character_cell_size);
+            for (i, part) in visible_parts.into_iter().enumerate() {
+                out.push(KittyImageChunk {
+                    cell_x: part.cell_x,
+                    cell_y: part.cell_y,
+                    source_image_id: original.source_image_id,
+                    // Distinct placement id per visible sub-rect of this image.
+                    placement_id: original.placement_id.wrapping_mul(1000) + i as u32,
+                    format: original.format,
+                    compressed: original.compressed,
+                    full_width: original.full_width,
+                    full_height: original.full_height,
+                    src_x: part.sixel_image_pixel_x,
+                    src_y: part.sixel_image_pixel_y,
+                    src_width: part.sixel_image_pixel_width,
+                    src_height: part.sixel_image_pixel_height,
+                    payload_b64: original.payload_b64.clone(),
+                });
+            }
+        }
+        out
     }
     fn remove_covered_parts(
         &self,
