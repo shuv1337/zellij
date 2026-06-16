@@ -99,6 +99,9 @@ impl<'a> PaneContentsAndUi<'a> {
                 clients.iter().copied(),
                 self.z_index,
             );
+            let kitty_deletions = self.pane.drain_kitty_deletions();
+            self.output
+                .add_kitty_deletions_to_multiple_clients(kitty_deletions, clients.iter().copied());
             if let Some(raw_vte_output) = raw_vte_output {
                 if !raw_vte_output.is_empty() {
                     self.output.add_post_vte_instruction_to_multiple_clients(
@@ -136,6 +139,9 @@ impl<'a> PaneContentsAndUi<'a> {
                 kitty_image_chunks,
                 self.z_index,
             );
+            let kitty_deletions = self.pane.drain_kitty_deletions();
+            self.output
+                .add_kitty_deletions_to_multiple_clients(kitty_deletions, std::iter::once(client_id));
             if let Some(raw_vte_output) = raw_vte_output {
                 self.output.add_post_vte_instruction_to_client(
                     client_id,

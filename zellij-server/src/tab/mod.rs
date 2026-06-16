@@ -279,6 +279,11 @@ pub trait Pane {
             Vec<KittyImageChunk>,
         )>,
     >; // TODO: better
+    /// Kitty source image ids deleted since the last call, for outer-terminal
+    /// teardown. Default: none (non-terminal panes carry no Kitty images).
+    fn drain_kitty_deletions(&mut self) -> Vec<u32> {
+        vec![]
+    }
     fn render_frame(
         &mut self,
         client_id: ClientId,

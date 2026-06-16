@@ -32,9 +32,20 @@ pub enum KittyOutcome {
     /// typed control and the (still base64) payload of *this chunk*; the Grid
     /// feeds it to a [`PendingUpload`] for `m=1` reassembly (Phase 1c).
     Store(KittyCommand),
-    /// Anything not handled in Phase 1 (delete `a=d`, unknown actions, SOS/PM
-    /// payloads that slipped past the `G` gate, malformed input).
+    /// `a=d` — delete images/placements.
+    Delete(KittyDelete),
+    /// Anything not handled (unknown actions, SOS/PM payloads that slipped past
+    /// the `G` gate, malformed input).
     Ignore,
+}
+
+/// A delete request (`a=d`). v1 handles "by image id" (`d=i,i=<id>`) and "all"
+/// (`d=a`); other selectors are treated as no-ops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KittyDelete {
+    ById(u32),
+    All,
+    Unsupported,
 }
 
 /// A Kitty support query (`a=q`). Carries only what is needed to synthesize the
@@ -163,7 +174,8 @@ pub fn dispatch(body: &[u8]) -> KittyOutcome {
         Some(i) => (&body[..i], body[i + 1..].to_vec()),
         None => (body, Vec::new()),
     };
-    let control = parse_control(&parse_keys(keys_bytes));
+    let keys = parse_keys(keys_bytes);
+    let control = parse_control(&keys);
 
     match control.action {
         KittyAction::Query => KittyOutcome::Query(KittyQuery {
@@ -174,8 +186,25 @@ pub fn dispatch(body: &[u8]) -> KittyOutcome {
         KittyAction::Transmit | KittyAction::TransmitAndDisplay | KittyAction::Place => {
             KittyOutcome::Store(KittyCommand { control, payload })
         },
-        // `d` (delete) and unknown actions are handled in later phases.
-        KittyAction::Delete | KittyAction::Unknown => KittyOutcome::Ignore,
+        KittyAction::Delete => {
+            // `d=` selector; default `a` (all) per the Kitty spec. Lower/upper
+            // case differ only in "also free data" semantics, which do not
+            // affect zellij's bookkeeping, so fold them.
+            let d = keys
+                .get(&'d')
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_else(|| "a".to_string());
+            let delete = match d.as_str() {
+                "a" => KittyDelete::All,
+                "i" => match control.image_id {
+                    Some(id) => KittyDelete::ById(id),
+                    None => KittyDelete::Unsupported,
+                },
+                _ => KittyDelete::Unsupported,
+            };
+            KittyOutcome::Delete(delete)
+        },
+        KittyAction::Unknown => KittyOutcome::Ignore,
     }
 }
 
@@ -386,6 +415,9 @@ pub struct KittyGrid {
     placements: Vec<KittyPlacement>,
     /// Counter for ids we allocate locally (anonymous transmits / `I`-number).
     next_local_id: u32,
+    /// Source image ids removed since the last drain — surfaced to the render
+    /// path so the outer terminal can be told to delete them (avoids ghosts).
+    deleted_image_ids: Vec<u32>,
 }
 
 impl KittyGrid {
@@ -453,6 +485,33 @@ impl KittyGrid {
                 return self.next_local_id;
             }
         }
+    }
+
+    /// Apply an explicit `a=d` delete: drop the matching image(s) and their
+    /// placements, recording the removed source ids for outer-terminal teardown.
+    pub fn delete(&mut self, request: KittyDelete) {
+        match request {
+            KittyDelete::ById(id) => {
+                if self.images.remove(&id).is_some() {
+                    self.deleted_image_ids.push(id);
+                }
+                self.placements.retain(|p| p.image_id != id);
+            },
+            KittyDelete::All => {
+                for id in self.images.keys().copied() {
+                    self.deleted_image_ids.push(id);
+                }
+                self.images.clear();
+                self.placements.clear();
+            },
+            KittyDelete::Unsupported => {},
+        }
+    }
+
+    /// Take the source ids removed since the last call (for outer-terminal
+    /// delete emission via the render path).
+    pub fn drain_deleted_image_ids(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.deleted_image_ids)
     }
 
     /// Pixel dimensions of a stored image, if known.
@@ -667,6 +726,13 @@ impl KittyRenderState {
         out
     }
 
+    /// Remove and return the outer id for `(client, source image)`, clearing its
+    /// transmitted flag. Used to emit a delete and forget the mapping.
+    pub fn take_outer_id(&mut self, client_id: u16, source_image_id: u32) -> Option<u32> {
+        self.transmitted.remove(&(client_id, source_image_id));
+        self.outer_ids.remove(&(client_id, source_image_id))
+    }
+
     /// Emit a delete of a source image's placements/data on a client.
     pub fn delete_image_bytes(outer_id: u32) -> Vec<u8> {
         format!("\x1b_Ga=d,d=i,q=2,i={}\x1b\\", outer_id).into_bytes()
@@ -764,8 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_and_unknown_are_ignored_in_phase1() {
-        assert_eq!(dispatch(b"a=d,i=1"), KittyOutcome::Ignore);
+    fn unknown_action_is_ignored() {
         assert_eq!(dispatch(b"a=z"), KittyOutcome::Ignore);
     }
 
@@ -991,5 +1056,59 @@ mod tests {
     fn delete_image_bytes_well_formed() {
         let bytes = String::from_utf8(KittyRenderState::delete_image_bytes(0x90000000)).unwrap();
         assert_eq!(bytes, "\x1b_Ga=d,d=i,q=2,i=2415919104\x1b\\");
+    }
+
+    // --- Phase 4: delete / lifecycle ---
+
+    #[test]
+    fn dispatch_delete_by_id_and_all() {
+        assert_eq!(dispatch(b"a=d,d=i,i=5"), KittyOutcome::Delete(KittyDelete::ById(5)));
+        assert_eq!(dispatch(b"a=d,d=a"), KittyOutcome::Delete(KittyDelete::All));
+        // default selector is "all"
+        assert_eq!(dispatch(b"a=d"), KittyOutcome::Delete(KittyDelete::All));
+        // case folding (d=I "also free data") collapses to by-id
+        assert_eq!(dispatch(b"a=d,d=I,i=9"), KittyOutcome::Delete(KittyDelete::ById(9)));
+    }
+
+    #[test]
+    fn grid_delete_by_id_removes_image_placement_and_records() {
+        let mut kg = KittyGrid::default();
+        kg.feed_chunk(store_cmd(b"a=T,f=32,s=1,v=1,i=3;AAAA"));
+        // The Grid normally anchors the placement after feed_chunk; do it here.
+        kg.add_placement(3, None, PixelRect::new(0, 0, 1, 1));
+        assert_eq!(kg.image_count(), 1);
+        assert_eq!(kg.placements().len(), 1);
+
+        kg.delete(KittyDelete::ById(3));
+        assert_eq!(kg.image_count(), 0);
+        assert!(kg.placements().is_empty());
+        assert_eq!(kg.drain_deleted_image_ids(), vec![3]);
+        // drained once, then empty
+        assert!(kg.drain_deleted_image_ids().is_empty());
+    }
+
+    #[test]
+    fn grid_delete_all_clears_everything() {
+        let mut kg = KittyGrid::default();
+        kg.feed_chunk(store_cmd(b"a=t,f=32,s=1,v=1,i=1;AAAA"));
+        kg.feed_chunk(store_cmd(b"a=t,f=32,s=1,v=1,i=2;AAAA"));
+        kg.delete(KittyDelete::All);
+        assert_eq!(kg.image_count(), 0);
+        let mut drained = kg.drain_deleted_image_ids();
+        drained.sort();
+        assert_eq!(drained, vec![1, 2]);
+    }
+
+    #[test]
+    fn take_outer_id_clears_mapping_and_returns_it() {
+        let mut rs = KittyRenderState::default();
+        let bytes = rs.render_chunk_bytes(1, &spec()); // transmits image 7 to client 1
+        assert!(!bytes.is_empty());
+        let outer = rs.take_outer_id(1, 7);
+        assert!(outer.is_some(), "outer id was allocated");
+        assert!(rs.take_outer_id(1, 7).is_none(), "mapping cleared");
+        // After taking, the next render re-transmits (fresh).
+        let again = String::from_utf8(rs.render_chunk_bytes(1, &spec())).unwrap();
+        assert!(again.contains("a=t"));
     }
 }

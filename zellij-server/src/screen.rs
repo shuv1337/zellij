@@ -3592,6 +3592,9 @@ impl Screen {
         let err_context = || format!("failed to remove client {client_id}");
 
         self.outer_supports_kitty.remove(&client_id);
+        // The detaching client's outer terminal is gone; drop its Kitty render
+        // state so a re-attach re-transmits cleanly (no stale outer ids).
+        self.kitty_render_state.borrow_mut().reset_client(client_id);
 
         // If the followed client disconnected, find the next regular client
         if Some(client_id) == self.followed_client_id {

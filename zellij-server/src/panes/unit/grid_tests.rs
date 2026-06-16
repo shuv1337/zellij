@@ -6190,6 +6190,28 @@ fn kitty_transmit_and_display_stores_anchors_and_advances_cursor() {
 }
 
 #[test]
+fn kitty_delete_removes_image_and_queues_outer_deletion() {
+    // Store an image, then delete it via `a=d`. The grid drops it and queues the
+    // source id for outer-terminal teardown.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=8,v=16,i=2;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 1);
+    for byte in b"\x1b_Ga=d,d=i,i=2\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 0, "image removed on a=d");
+    assert!(grid.kitty_grid.placements().is_empty());
+    assert_eq!(
+        grid.drain_kitty_deletions(),
+        vec![2],
+        "deleted source id queued for outer-terminal teardown"
+    );
+}
+
+#[test]
 fn kitty_transmit_only_stores_without_placement() {
     // `a=t` (transmit-only) stores the image but anchors no placement and does
     // not move the cursor.

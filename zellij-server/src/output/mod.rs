@@ -391,6 +391,9 @@ pub struct Output {
     client_character_chunks: HashMap<ClientId, Vec<CharacterChunk>>,
     sixel_chunks: HashMap<ClientId, Vec<SixelImageChunk>>,
     kitty_chunks: HashMap<ClientId, Vec<KittyImageChunk>>,
+    /// Per-client Kitty source image ids to delete from the outer terminal this
+    /// render (reaped / explicitly `a=d`-deleted images).
+    kitty_deletions: HashMap<ClientId, Vec<u32>>,
     /// Per-client outer-terminal Kitty support snapshot for this render (set by
     /// `Screen` before serialize). Clients absent / false get no Kitty bytes.
     outer_supports_kitty: HashMap<ClientId, bool>,
@@ -455,6 +458,22 @@ impl Output {
                 kitty_image_chunks.clone(),
                 z_index,
             );
+        }
+    }
+
+    pub fn add_kitty_deletions_to_multiple_clients(
+        &mut self,
+        deleted_image_ids: Vec<u32>,
+        client_ids: impl Iterator<Item = ClientId>,
+    ) {
+        if deleted_image_ids.is_empty() {
+            return;
+        }
+        for client_id in client_ids {
+            self.kitty_deletions
+                .entry(client_id)
+                .or_insert_with(Vec::new)
+                .extend(deleted_image_ids.iter().copied());
         }
     }
     pub fn add_clients(
@@ -616,6 +635,23 @@ impl Output {
                 .copied()
                 .unwrap_or(false);
             let mut kitty_state = self.kitty_render_state.borrow_mut();
+            // Delete reaped / explicitly-deleted images from the outer terminal
+            // first (before re-placing surviving ones).
+            if let Some(deletions) = self.kitty_deletions.remove(&client_id) {
+                for source_id in deletions {
+                    if let Some(outer_id) = kitty_state.take_outer_id(client_id, source_id) {
+                        if kitty_supported {
+                            client_serialized_render_instructions.push_str(
+                                &String::from_utf8_lossy(
+                                    &crate::panes::kitty::KittyRenderState::delete_image_bytes(
+                                        outer_id,
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
             let kitty_render = if kitty_supported {
                 Some((&mut *kitty_state, client_id))
             } else {
@@ -698,6 +734,21 @@ impl Output {
                 .copied()
                 .unwrap_or(false);
             let mut kitty_state = self.kitty_render_state.borrow_mut();
+            if let Some(deletions) = self.kitty_deletions.remove(&client_id) {
+                for source_id in deletions {
+                    if let Some(outer_id) = kitty_state.take_outer_id(client_id, source_id) {
+                        if kitty_supported {
+                            client_serialized_render_instructions.push_str(
+                                &String::from_utf8_lossy(
+                                    &crate::panes::kitty::KittyRenderState::delete_image_bytes(
+                                        outer_id,
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
             let kitty_render = if kitty_supported {
                 Some((&mut *kitty_state, client_id))
             } else {

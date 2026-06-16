@@ -145,6 +145,49 @@ fn kitty_chunks_emitted_only_to_supporting_clients() {
 }
 
 #[test]
+fn kitty_deletion_emits_delete_to_supporting_client() {
+    use crate::output::KittyImageChunk;
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+
+    // First render: transmit + place image 5 (allocates an outer id).
+    let chunk = KittyImageChunk {
+        cell_x: 0,
+        cell_y: 0,
+        source_image_id: 5,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 4,
+        full_height: 4,
+        src_x: 0,
+        src_y: 0,
+        src_width: 4,
+        src_height: 4,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    output.add_kitty_image_chunks_to_client(1, vec![chunk], None);
+    let _ = output.serialize().unwrap();
+
+    // Re-add the same client entry (serialize drained it) and now delete image 5.
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+    output.add_kitty_deletions_to_multiple_clients(vec![5], std::iter::once(1));
+    let serialized = output.serialize().unwrap();
+    let c1 = serialized.get(&1).cloned().unwrap_or_default();
+    assert!(c1.contains("a=d,d=i,q=2"), "delete emitted to outer terminal: {:?}", c1);
+}
+
+#[test]
 fn test_is_dirty_with_pre_vte_instructions() {
     let mut output = create_test_output();
     let client_ids = create_test_clients(1);

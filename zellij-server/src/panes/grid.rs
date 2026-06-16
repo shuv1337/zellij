@@ -994,6 +994,11 @@ impl Grid {
     pub fn render_full_viewport(&mut self) {
         self.output_buffer.update_all_lines();
     }
+    /// Source image ids deleted since the last call — surfaced to the render
+    /// path so the outer terminal can be told to delete them.
+    pub fn drain_kitty_deletions(&mut self) -> Vec<u32> {
+        self.kitty_grid.drain_deleted_image_ids()
+    }
     pub fn update_line_for_rendering(&mut self, line_index: usize) {
         self.output_buffer.update_line(line_index);
     }
@@ -4593,6 +4598,12 @@ impl Perform for Grid {
                         }
                     }
                 }
+            },
+            // Explicit delete (`a=d`): drop from the grid; the removed source
+            // ids are drained at render time to delete from the outer terminal.
+            crate::panes::kitty::KittyOutcome::Delete(request) => {
+                self.kitty_grid.delete(request);
+                self.mark_for_rerender();
             },
             crate::panes::kitty::KittyOutcome::Ignore => {},
         }

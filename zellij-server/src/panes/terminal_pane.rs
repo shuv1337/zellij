@@ -381,6 +381,9 @@ impl Pane for TerminalPane {
             Ok(None)
         }
     }
+    fn drain_kitty_deletions(&mut self) -> Vec<u32> {
+        self.grid.drain_kitty_deletions()
+    }
     fn render_frame(
         &mut self,
         client_id: ClientId,
