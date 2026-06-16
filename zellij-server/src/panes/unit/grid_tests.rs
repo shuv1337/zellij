@@ -6212,6 +6212,63 @@ fn kitty_delete_removes_image_and_queues_outer_deletion() {
 }
 
 #[test]
+fn kitty_alt_screen_swaps_images_and_queues_deletions() {
+    // Entering the alternate screen must hide primary-screen Kitty images: the
+    // active grid becomes fresh (no images) and the primary's images are queued
+    // for outer-terminal deletion. Exiting restores them.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=8,v=16,i=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 1);
+
+    for byte in b"\x1b[?1049h" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(
+        grid.kitty_grid.image_count(),
+        0,
+        "alternate screen starts with no Kitty images"
+    );
+    assert_eq!(
+        grid.drain_kitty_deletions(),
+        vec![1],
+        "primary image queued for outer-terminal deletion on alt-screen enter"
+    );
+
+    for byte in b"\x1b[?1049l" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(
+        grid.kitty_grid.image_count(),
+        1,
+        "primary Kitty image restored on alt-screen exit"
+    );
+}
+
+#[test]
+fn kitty_text_over_image_reaps_placement() {
+    // Drawing a character over an image cell reaps the placement (Kitty can't be
+    // hole-punched like sixel) and queues the outer-terminal delete.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=8,v=16,i=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.placements().len(), 1);
+    // Cursor home, then write a character over the image's cell.
+    for byte in b"\x1b[HX" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(
+        grid.kitty_grid.placements().is_empty(),
+        "text over the image reaps the placement"
+    );
+    assert_eq!(grid.drain_kitty_deletions(), vec![1]);
+}
+
+#[test]
 fn kitty_transmit_only_stores_without_placement() {
     // `a=t` (transmit-only) stores the image but anchors no placement and does
     // not move the cursor.

@@ -455,6 +455,22 @@ impl KittyGrid {
                 let display = matches!(upload.control.action, KittyAction::TransmitAndDisplay);
                 let placement_id = upload.control.placement_id;
                 let finished = upload.finish();
+                // v1 only handles direct (`t=d`) media. Storing a file /
+                // shared-memory transmission and re-emitting its payload inline
+                // as `a=t` would corrupt it, so reject unsupported media here
+                // (the whole multi-chunk upload is accumulated then discarded).
+                if !finished.control.medium_supported() {
+                    return None;
+                }
+                // v1 keys storage/placement/delete by `i=` (or an anonymous
+                // local id). We do not implement `I=` image-number addressing,
+                // so reject `I=`-only commands rather than store an image the app
+                // cannot reference.
+                if finished.control.image_id.is_none()
+                    && finished.control.image_number.is_some()
+                {
+                    return None;
+                }
                 let id = self.allocate_id(finished.control.image_id);
                 self.images.insert(
                     id,
@@ -505,6 +521,45 @@ impl KittyGrid {
                 self.placements.clear();
             },
             KittyDelete::Unsupported => {},
+        }
+    }
+
+    /// All currently-stored source image ids.
+    pub fn image_ids(&self) -> Vec<u32> {
+        self.images.keys().copied().collect()
+    }
+
+    /// Queue source ids for outer-terminal deletion without otherwise touching
+    /// the grid (used by alt-screen enter/exit to hide a screen's images).
+    pub fn queue_deletions(&mut self, ids: Vec<u32>) {
+        self.deleted_image_ids.extend(ids);
+    }
+
+    /// Reap any placement overlapping `rect` (absolute scrollback pixels). Used
+    /// when terminal text is drawn over an image cell: unlike sixel, a Kitty
+    /// placement cannot have a rectangular hole punched, so the whole placement
+    /// is removed (text wins). Source images with no remaining placement are
+    /// dropped and queued for outer-terminal deletion.
+    pub fn reap_placements_intersecting(&mut self, rect: &PixelRect) {
+        let before = self.placements.len();
+        let mut hit_images = Vec::new();
+        self.placements.retain(|p| {
+            if p.rect.intersecting_rect(rect).is_some() {
+                hit_images.push(p.image_id);
+                false
+            } else {
+                true
+            }
+        });
+        if self.placements.len() == before {
+            return;
+        }
+        for id in hit_images {
+            if !self.placements.iter().any(|p| p.image_id == id)
+                && self.images.remove(&id).is_some()
+            {
+                self.deleted_image_ids.push(id);
+            }
         }
     }
 
@@ -975,6 +1030,45 @@ mod tests {
         let mut kg = KittyGrid::default();
         kg.feed_chunk(store_cmd(b"a=t,f=32,s=1,v=1;AAAA")); // no i=
         assert_eq!(kg.image_count(), 1);
+    }
+
+    #[test]
+    fn unsupported_media_is_not_stored() {
+        // t=f (file) / t=s (shared mem): must not be stored, else render would
+        // re-emit the path/handle as an inline a=t payload and corrupt it.
+        let mut kg = KittyGrid::default();
+        assert_eq!(kg.feed_chunk(store_cmd(b"a=T,t=f,f=100,i=1;L3RtcC9pbWc=")), None);
+        assert_eq!(kg.feed_chunk(store_cmd(b"a=t,t=s,f=32,s=1,v=1,i=2;AAAA")), None);
+        assert_eq!(kg.image_count(), 0);
+    }
+
+    #[test]
+    fn image_number_only_command_is_not_stored() {
+        // I=-only addressing is unsupported (we key by i=); must not store an
+        // image the app cannot later reference.
+        let mut kg = KittyGrid::default();
+        assert_eq!(kg.feed_chunk(store_cmd(b"a=T,f=32,s=1,v=1,I=7;AAAA")), None);
+        assert_eq!(kg.image_count(), 0);
+        // …but an anonymous transmit (neither i nor I) is still fine.
+        kg.feed_chunk(store_cmd(b"a=t,f=32,s=1,v=1;AAAA"));
+        assert_eq!(kg.image_count(), 1);
+    }
+
+    #[test]
+    fn reap_placements_intersecting_removes_overlapping_image() {
+        let mut kg = KittyGrid::default();
+        kg.feed_chunk(store_cmd(b"a=T,f=32,s=20,v=20,i=4;AAAA"));
+        kg.add_placement(4, None, PixelRect::new(0, 0, 20, 20));
+        // A cell rect inside the image reaps the whole placement + image.
+        kg.reap_placements_intersecting(&PixelRect::new(0, 0, 16, 8));
+        assert!(kg.placements().is_empty());
+        assert_eq!(kg.image_count(), 0);
+        assert_eq!(kg.drain_deleted_image_ids(), vec![4]);
+        // A non-overlapping rect reaps nothing.
+        kg.feed_chunk(store_cmd(b"a=T,f=32,s=8,v=8,i=5;AAAA"));
+        kg.add_placement(5, None, PixelRect::new(0, 0, 8, 8));
+        kg.reap_placements_intersecting(&PixelRect::new(800, 800, 16, 8));
+        assert_eq!(kg.placements().len(), 1);
     }
 
     // --- KittyRenderState emission (Phase 3) ---

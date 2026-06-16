@@ -236,15 +236,24 @@ survives partial scroll/coverage; unsupported clients get the placeholder.
 - [x] **Tests:** dispatch delete variants; grid delete by-id/all + drain;
   `take_outer_id`; Grid-level `a=d` teardown; output deletion emission.
 
-**Deferred — invasive hot-path hooks, edge cases, hardware-verifiable:**
+**Done (added in PR review round):**
+- [x] Alt-screen swap isolation: `KittyGrid` is now part of `AlternateScreenState`;
+  enter stashes the primary grid + queues its images for outer deletion, exit
+  restores + queues the alt images for deletion (vim/less no longer bleed primary
+  images). Tested.
+- [x] Draw-over-image reap: text drawn over an image cell reaps the whole
+  placement (Kitty can't be hole-punched like sixel) + queues the outer delete,
+  hooked into `add_character_at_cursor_position` beside the sixel cut. Tested.
+- [x] Unsupported media (`t=f`/`t=t`/`t=s`) and `I=`-only addressing are rejected
+  before storage (no corrupt re-emit; no unreferenceable images). Tested.
+
+**Still deferred — hardware-verifiable:**
 - [ ] Scroll-offset on **full** scrollback (`KittyGrid::offset_grid_top` hooked into
-  `bounded_push`) — images currently anchor correctly until scrollback fills, then
-  drift. The one remaining *functional* (non-edge) gap; deferred to avoid
-  unverifiable hot-path changes.
-- [ ] Implicit reap on cell-overwrite / ED / reset (draw-over-image).
-- [ ] Alt-screen swap isolation (include `KittyGrid` in `AlternateScreenState`;
-  delete on enter, re-place on exit) — vim/less currently don't hide primary images.
+  `bounded_push`) — images anchor correctly until scrollback fills, then drift.
+- [ ] ED / full-reset reap (the `add_character` overwrite path is covered; the
+  clear-screen / reset paths are not yet).
 - [ ] Resize rescale (`character_cell_size_possibly_changed` analog).
+- [ ] `I=` image-number → local-id mapping + reply (currently rejected, not mapped).
 
 ---
 

@@ -1937,6 +1937,11 @@ impl Grid {
                                 .remove_pixels_from_image(image_id, rect_in_image_to_cut_out);
                         }
                     }
+                    // Kitty placements can't be hole-punched like sixel, so text
+                    // drawn over an image reaps the whole placement (and queues
+                    // the outer-terminal delete).
+                    self.kitty_grid
+                        .reap_placements_intersecting(&rect_to_cut_out);
                 }
                 self.output_buffer.update_line(self.cursor.y);
             },
@@ -3936,13 +3941,20 @@ impl Perform for Grid {
                                     // outside of the alternate_screen_state struct
                                     self.sixel_grid.reap_images(image_ids_to_reap);
                                 }
+                                // The alternate screen's Kitty images must be
+                                // deleted from the outer terminal; collect them
+                                // before restoring, then queue on the restored
+                                // primary grid (which becomes the active one).
+                                let alternate_kitty_image_ids = self.kitty_grid.image_ids();
                                 alternate_screen_state.apply_contents_to(
                                     &mut self.lines_above,
                                     &mut self.viewport,
                                     &mut self.cursor,
                                     &mut self.sixel_grid,
+                                    &mut self.kitty_grid,
                                     &mut self.supports_kitty_keyboard_protocol,
                                 );
+                                self.kitty_grid.queue_deletions(alternate_kitty_image_ids);
                             }
                             self.alternate_screen_state = None;
                             self.clear_viewport_before_rendering = true;
@@ -4049,11 +4061,23 @@ impl Perform for Grid {
                                 &mut self.sixel_grid,
                                 SixelGrid::new(self.character_cell_size.clone(), sixel_image_store),
                             );
+                            // Stash the primary screen's Kitty grid and install a
+                            // fresh one; queue the primary's images for outer-
+                            // terminal deletion so they don't bleed through the
+                            // alternate screen (vim/less). They re-transmit on
+                            // exit when the primary grid is restored.
+                            let primary_kitty_image_ids = self.kitty_grid.image_ids();
+                            let alternate_kittygrid = std::mem::replace(
+                                &mut self.kitty_grid,
+                                crate::panes::kitty::KittyGrid::default(),
+                            );
+                            self.kitty_grid.queue_deletions(primary_kitty_image_ids);
                             self.alternate_screen_state = Some(AlternateScreenState::new(
                                 current_lines_above,
                                 current_viewport,
                                 current_cursor,
                                 alternate_sixelgrid,
+                                alternate_kittygrid,
                                 current_supports_kitty_keyboard_protocol,
                             ));
                             self.clear_viewport_before_rendering = true;
@@ -4616,6 +4640,7 @@ pub struct AlternateScreenState {
     viewport: VecDeque<Row>,
     cursor: Cursor,
     sixel_grid: SixelGrid,
+    kitty_grid: crate::panes::kitty::KittyGrid,
     supports_kitty_keyboard_protocol: bool,
 }
 impl AlternateScreenState {
@@ -4624,6 +4649,7 @@ impl AlternateScreenState {
         viewport: VecDeque<Row>,
         cursor: Cursor,
         sixel_grid: SixelGrid,
+        kitty_grid: crate::panes::kitty::KittyGrid,
         supports_kitty_keyboard_protocol: bool,
     ) -> Self {
         AlternateScreenState {
@@ -4631,6 +4657,7 @@ impl AlternateScreenState {
             viewport,
             cursor,
             sixel_grid,
+            kitty_grid,
             supports_kitty_keyboard_protocol,
         }
     }
@@ -4640,12 +4667,14 @@ impl AlternateScreenState {
         viewport: &mut VecDeque<Row>,
         cursor: &mut Cursor,
         sixel_grid: &mut SixelGrid,
+        kitty_grid: &mut crate::panes::kitty::KittyGrid,
         supports_kitty_keyboard_protocol: &mut bool,
     ) {
         std::mem::swap(&mut self.lines_above, lines_above);
         std::mem::swap(&mut self.viewport, viewport);
         std::mem::swap(&mut self.cursor, cursor);
         std::mem::swap(&mut self.sixel_grid, sixel_grid);
+        std::mem::swap(&mut self.kitty_grid, kitty_grid);
         std::mem::swap(
             &mut self.supports_kitty_keyboard_protocol,
             supports_kitty_keyboard_protocol,
