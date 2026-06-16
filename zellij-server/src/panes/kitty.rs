@@ -559,6 +559,15 @@ impl KittyGrid {
         self.images.keys().copied().collect()
     }
 
+    /// Drop every stored image and placement, queueing their source ids for
+    /// outer-terminal deletion. Used by Erase-Display (`CSI 2 J` / `CSI 3 J`,
+    /// e.g. the `clear` command) and terminal reset, mirroring the sixel grid's
+    /// `clear()` so images do not stay stuck in the outer terminal after the
+    /// inner grid is wiped. Equivalent to `delete(KittyDelete::All)`.
+    pub fn clear(&mut self) {
+        self.delete(KittyDelete::All);
+    }
+
     /// Queue source ids for outer-terminal deletion without otherwise touching
     /// the grid (used by alt-screen enter/exit to hide a screen's images).
     pub fn queue_deletions(&mut self, ids: Vec<u32>) {
@@ -1363,6 +1372,26 @@ mod tests {
         let mut drained = kg.drain_deleted_image_ids();
         drained.sort();
         assert_eq!(drained, vec![1, 2]);
+    }
+
+    #[test]
+    fn grid_clear_drops_images_and_queues_outer_deletions() {
+        // Erase-Display / reset path: `clear()` must drop every image+placement
+        // AND queue their ids for outer-terminal deletion, otherwise an image
+        // stays stuck in the outer terminal after `clear`.
+        let mut kg = KittyGrid::default();
+        kg.feed_chunk(store_cmd(b"a=T,f=32,s=4,v=4,i=1;AAAA"));
+        kg.add_placement(1, None, PixelRect::new(0, 0, 4, 4));
+        kg.feed_chunk(store_cmd(b"a=T,f=32,s=4,v=4,i=2;AAAA"));
+        kg.add_placement(2, None, PixelRect::new(0, 0, 4, 4));
+        assert_eq!(kg.image_count(), 2);
+
+        kg.clear();
+        assert_eq!(kg.image_count(), 0, "all images dropped");
+        assert!(kg.placements().is_empty(), "all placements dropped");
+        let mut drained = kg.drain_deleted_image_ids();
+        drained.sort();
+        assert_eq!(drained, vec![1, 2], "both ids queued for outer-terminal delete");
     }
 
     #[test]

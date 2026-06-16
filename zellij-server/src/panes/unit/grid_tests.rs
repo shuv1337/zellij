@@ -6213,6 +6213,39 @@ fn kitty_delete_removes_image_and_queues_outer_deletion() {
 }
 
 #[test]
+fn kitty_erase_display_clears_images_and_queues_outer_deletion() {
+    // The `clear` command emits Erase-Display (`CSI 2 J` then `CSI 3 J`). That
+    // wipes the grid text; the Kitty images must also be torn down from the
+    // outer terminal, or they stay stuck on screen after `clear`.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=8,v=16,i=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 1);
+    assert_eq!(grid.kitty_grid.placements().len(), 1);
+
+    // CSI 2 J — erase entire display.
+    for byte in b"\x1b[2J" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(
+        grid.kitty_grid.image_count(),
+        0,
+        "Erase-Display drops all Kitty images"
+    );
+    assert!(
+        grid.kitty_grid.placements().is_empty(),
+        "Erase-Display drops all placements"
+    );
+    assert_eq!(
+        grid.drain_kitty_deletions(),
+        vec![1],
+        "erased image queued for outer-terminal teardown"
+    );
+}
+
+#[test]
 fn kitty_alt_screen_swaps_images_and_queues_deletions() {
     // Entering the alternate screen must hide primary-screen Kitty images: the
     // active grid becomes fresh (no images) and the primary's images are queued

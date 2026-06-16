@@ -2326,6 +2326,8 @@ impl Grid {
         if let Some(images_to_reap) = self.sixel_grid.clear() {
             self.sixel_grid.reap_images(images_to_reap);
         }
+        // Reset must also tear down Kitty images from the outer terminal.
+        self.kitty_grid.clear();
     }
     fn set_preceding_character(&mut self, terminal_character: TerminalCharacter) {
         self.preceding_char = Some(terminal_character);
@@ -3891,11 +3893,17 @@ impl Perform for Grid {
                     if let Some(images_to_reap) = self.sixel_grid.clear() {
                         self.sixel_grid.reap_images(images_to_reap);
                     }
+                    // Erase-Display (e.g. `clear`) wipes the grid text; the
+                    // Kitty images must be deleted from the outer terminal too,
+                    // or they stay stuck on screen. Queued ids are drained at
+                    // render time (`drain_kitty_deletions`).
+                    self.kitty_grid.clear();
                 } else if clear_type == 3 {
                     self.clear_lines_above();
                     if let Some(images_to_reap) = self.sixel_grid.clear() {
                         self.sixel_grid.reap_images(images_to_reap);
                     }
+                    self.kitty_grid.clear();
                 }
             };
         } else if c == 'H' || c == 'f' {
