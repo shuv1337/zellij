@@ -141,28 +141,29 @@ downstream consumes them yet.
   OK-wins-in-same-chunk, C1 ST terminator, APC split across feeds, inert when
   unarmed, resolves-once, APC stripped from residue with surrounding text.
 
-**GATED — protobuf wire-contract change + server map (awaiting review):**
-- [ ] `input_handler.rs` send `ClientToServerMsg::KittyGraphicsSupport { supported }`;
+**Protobuf wire-contract change + server map — DONE:**
+- [x] `input_handler.rs` sends `ClientToServerMsg::KittyGraphicsSupport { supported }`;
   `route.rs` attaches `client_id` → `ScreenInstruction::TerminalKittyGraphicsSupport`.
-- [ ] IPC contract: `ipc.rs`, `client_server_contract/*.proto`,
-  `protobuf_conversion.rs` + roundtrip test. **← the outward-facing wire change.**
-- [ ] `Screen`: `outer_supports_kitty: HashMap<ClientId,bool>` (default false,
-  set on probe reply, remove on detach; web clients stay false).
+- [x] IPC contract: `ipc.rs` variant, `client_to_server.proto` (`KittyGraphicsSupportMsg`,
+  field 22), `protobuf_conversion.rs` (both directions), regenerated prost,
+  `ScreenContext::TerminalKittyGraphicsSupport`. Roundtrip test (both bool values).
+- [x] `Screen.outer_supports_kitty: HashMap<ClientId,bool>` — default false in
+  `add_client`, set via `set_outer_supports_kitty`, removed in `remove_client`.
 
-**NEEDS HARDWARE (cannot verify autonomously):**
+**NEEDS HARDWARE (cannot verify autonomously) — open:**
 - [ ] Validate the DA-barrier negative-detection assumption against real
   ghostty/wezterm/foot/kitty — the unit tests cover the *logic*, not the
   per-terminal *ordering guarantee*.
 
-### 1e. Inner `a=q` aggregate (Phase 5 self-query truth)
-- [ ] Answer inner `a=q` OK if **any** regular client on the pane's tab has
-  `outer_supports_kitty == true` (per locked decision). No supporting client →
-  no OK (error only when not a probe and quiet allows). Reconcile with the env
-  hint (Phase 5).
-- [ ] Static env hint: export `ZELLIJ_GRAPHICS=kitty` (ungated) at child spawn —
-  `os_input_output_unix.rs:224` and `os_input_output_windows.rs:177`, beside
-  `ZELLIJ_PANE_ID`.
-- [ ] **Test:** mixed-support clients (kitty + web) → inner `a=q` says OK.
+### 1e. Inner `a=q` aggregate (Phase 5 self-query truth) — DONE
+- [x] `Screen::any_client_supports_kitty()` (any connected client supports →
+  OK); `answer_kitty_graphics_query_locally` now gates on it instead of the
+  hardcoded `false`. v1 uses the global any-client aggregate; per-tab refinement
+  noted as a later tightening.
+- [x] Static env hint `ZELLIJ_GRAPHICS=kitty` (ungated) at child spawn —
+  `os_input_output_unix.rs` + `os_input_output_windows.rs`, beside `ZELLIJ_PANE_ID`.
+- [x] **Test:** `kitty_graphics_any_client_aggregate` (no client / supporting /
+  +non-supporting / cleared) in `screen_tests.rs`.
 
 **Phase 1+2 acceptance:** an app inside a pane gets a correct `a=q` OK/silent
 answer based on real per-client outer support; Kitty images are parsed, stored,

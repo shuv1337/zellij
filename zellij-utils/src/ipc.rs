@@ -176,6 +176,12 @@ pub enum ClientToServerMsg {
     SoftKeyboardVisibilityChanged {
         visible: bool,
     },
+    /// Result of the client's startup Kitty graphics support probe for its
+    /// outer terminal. Per-client capability: the server keys it by the
+    /// connection's `client_id` (attached in `route.rs`).
+    KittyGraphicsSupport {
+        supported: bool,
+    },
 }
 
 // Types of messages sent from the server to the client

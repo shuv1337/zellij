@@ -540,6 +540,9 @@ pub enum ScreenInstruction {
     /// `HostTerminalThemeChanged` plugin event, and per-pane DSR forwarding
     /// for panes that opted in via `CSI ? 2031 h`.
     HostTerminalThemeChanged(HostTerminalThemeMode),
+    /// A client reported whether its outer terminal supports the Kitty graphics
+    /// protocol (result of the client's startup probe). Per-client capability.
+    TerminalKittyGraphicsSupport(ClientId, bool),
     /// Manual theme actions issued via the CLI (e.g. `zellij action set-dark-theme`)
     /// or a keybinding. They share the same convergence point as
     /// `HostTerminalThemeChanged`, but additionally surface a CLI-friendly error
@@ -1026,6 +1029,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::HostTerminalThemeChanged(..) => {
                 ScreenContext::HostTerminalThemeChanged
             },
+            ScreenInstruction::TerminalKittyGraphicsSupport(..) => {
+                ScreenContext::TerminalKittyGraphicsSupport
+            },
             ScreenInstruction::SetDarkTheme(..) => ScreenContext::SetDarkTheme,
             ScreenInstruction::SetLightTheme(..) => ScreenContext::SetLightTheme,
             ScreenInstruction::ToggleTheme(..) => ScreenContext::ToggleTheme,
@@ -1403,6 +1409,11 @@ pub(crate) struct Screen {
     size: Size,
     pixel_dimensions: PixelDimensions,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
+    /// Per-client outer-terminal Kitty graphics support (result of each client's
+    /// startup probe). Defaults to `false` on connect and is removed on detach;
+    /// web clients stay `false` until they gain a Kitty render implementation.
+    /// Unlike `pixel_dimensions` (global), this is per connected client.
+    outer_supports_kitty: HashMap<ClientId, bool>,
     stacked_resize: Rc<RefCell<bool>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
     terminal_emulator_colors: Rc<RefCell<Palette>>,
@@ -1565,6 +1576,7 @@ impl Screen {
             size: client_attributes.size,
             pixel_dimensions: Default::default(),
             character_cell_size: Rc::new(RefCell::new(None)),
+            outer_supports_kitty: HashMap::new(),
             stacked_resize: Rc::new(RefCell::new(stacked_resize)),
             sixel_image_store: Rc::new(RefCell::new(SixelImageStore::default())),
             style: client_attributes.style,
@@ -2591,12 +2603,12 @@ impl Screen {
         if matches!(pane_id, PaneId::Plugin(_)) {
             return;
         }
-        // TODO(Phase 1e): answer OK iff any regular client viewing the pane's
-        // tab has `outer_supports_kitty == true` (the "any client" aggregate),
-        // populated by capability detection (Phase 1d). Until that lands, no
-        // client is known to support Kitty, so the aggregate is false and we
-        // stay silent.
-        let supported = false;
+        // Phase 1e "any client" aggregate: answer OK if any connected client's
+        // outer terminal can render Kitty (render output is already per-client
+        // gated, so one supporting client is enough; others get a placeholder).
+        // v1 uses the global any-client aggregate; a per-tab refinement
+        // ("clients viewing this pane's tab") can tighten it later.
+        let supported = self.any_client_supports_kitty();
         let reply = if supported {
             query.ok_reply().unwrap_or_default()
         } else {
@@ -3521,6 +3533,11 @@ impl Screen {
             format!("failed to attach client {client_id} to tab with index {tab_index}")
         };
 
+        // Outer-terminal Kitty support defaults to false until the client's
+        // startup probe reports otherwise (web clients have no probe and stay
+        // false).
+        self.outer_supports_kitty.entry(client_id).or_insert(false);
+
         // Set followed_client_id to the first regular client if not already set
         if self.followed_client_id.is_none() && !self.watcher_clients.contains_key(&client_id) {
             self.followed_client_id = Some(client_id);
@@ -3562,6 +3579,8 @@ impl Screen {
 
     pub fn remove_client(&mut self, client_id: ClientId) -> Result<()> {
         let err_context = || format!("failed to remove client {client_id}");
+
+        self.outer_supports_kitty.remove(&client_id);
 
         // If the followed client disconnected, find the next regular client
         if Some(client_id) == self.followed_client_id {
@@ -5114,6 +5133,27 @@ impl Screen {
     /// 3. fans out an `Event::HostTerminalThemeChanged` plugin event,
     /// 4. forwards a `CSI ?997;{1|2}n` DSR onto the pty of every terminal pane
     ///    whose app opted in via `CSI ? 2031 h`.
+    /// Record a client's outer-terminal Kitty graphics support (startup probe
+    /// result). Only updates clients that are actually connected.
+    pub fn set_outer_supports_kitty(&mut self, client_id: ClientId, supported: bool) {
+        if let Some(entry) = self.outer_supports_kitty.get_mut(&client_id) {
+            *entry = supported;
+        } else {
+            // Probe reply may race ahead of `add_client`; record it anyway so
+            // the value isn't lost (it's cleaned up on detach regardless).
+            self.outer_supports_kitty.insert(client_id, supported);
+        }
+    }
+
+    /// Phase 1e aggregate: does *any* connected client's outer terminal support
+    /// Kitty? This is the conservative-but-useful policy for answering an inner
+    /// app's `a=q` probe — render output is already per-client gated, so a single
+    /// supporting client is enough to advertise support (others get a
+    /// placeholder). Returns false when no client supports it (or none known).
+    pub fn any_client_supports_kitty(&self) -> bool {
+        self.outer_supports_kitty.values().any(|&v| v)
+    }
+
     pub fn update_host_terminal_theme_mode(&mut self, mode: HostTerminalThemeMode) -> Result<()> {
         let err_context = || "Failed to update host terminal theme mode".to_string();
 
@@ -7867,6 +7907,9 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::HostTerminalThemeChanged(mode) => {
                 screen.update_host_terminal_theme_mode(mode)?;
+            },
+            ScreenInstruction::TerminalKittyGraphicsSupport(client_id, supported) => {
+                screen.set_outer_supports_kitty(client_id, supported);
             },
             ScreenInstruction::SetDarkTheme(mut completion_tx) => {
                 screen.apply_manual_host_terminal_theme_mode(

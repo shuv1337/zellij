@@ -2927,7 +2927,7 @@ impl MobileLayout {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientToServerMsg {
-    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21")]
+    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22")]
     pub message: ::core::option::Option<client_to_server_msg::Message>,
 }
 /// Nested message and enum types in `ClientToServerMsg`.
@@ -2977,6 +2977,8 @@ pub mod client_to_server_msg {
         HostTerminalThemeChanged(super::HostTerminalThemeChangedMsg),
         #[prost(message, tag="21")]
         SoftKeyboardVisibilityChanged(super::SoftKeyboardVisibilityChangedMsg),
+        #[prost(message, tag="22")]
+        KittyGraphicsSupport(super::KittyGraphicsSupportMsg),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3123,6 +3125,12 @@ pub struct ForwardedReplyFromHostMsg {
 pub struct HostTerminalThemeChangedMsg {
     #[prost(enumeration="HostTerminalThemeIndication", tag="1")]
     pub mode: i32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KittyGraphicsSupportMsg {
+    #[prost(bool, tag="1")]
+    pub supported: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

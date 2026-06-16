@@ -222,6 +222,11 @@ fn handle_openpty(
         command
             .args(&cmd.args)
             .env("ZELLIJ_PANE_ID", &format!("{}", terminal_id))
+            // Static capability hint: this fork can carry Kitty graphics. NOT
+            // gated on outer-terminal support (that is discovered async and can
+            // change as clients attach/detach); query-based detection (`a=q`) is
+            // the runtime truth. Plain ZELLIJ is insufficient — upstream sets it.
+            .env("ZELLIJ_GRAPHICS", "kitty")
             .pre_exec(move || -> io::Result<()> {
                 if libc::login_tty(pid_secondary) != 0 {
                     panic!("failed to set controlling terminal");
