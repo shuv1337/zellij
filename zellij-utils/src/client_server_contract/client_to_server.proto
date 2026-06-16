@@ -26,6 +26,7 @@ message ClientToServerMsg {
     ForwardedReplyFromHostMsg forwarded_reply_from_host = 19;
     HostTerminalThemeChangedMsg host_terminal_theme_changed = 20;
     SoftKeyboardVisibilityChangedMsg soft_keyboard_visibility_changed = 21;
+    KittyGraphicsSupportMsg kitty_graphics_support = 22;
   }
 }
 
@@ -127,6 +128,10 @@ message ForwardedReplyFromHostMsg {
 
 message HostTerminalThemeChangedMsg {
   HostTerminalThemeIndication mode = 1;
+}
+
+message KittyGraphicsSupportMsg {
+  bool supported = 1;
 }
 
 enum HostTerminalThemeIndication {

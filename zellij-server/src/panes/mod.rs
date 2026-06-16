@@ -1,6 +1,7 @@
 pub mod alacritty_functions;
 pub mod grid;
 pub mod hyperlink_tracker;
+pub mod kitty;
 pub mod link_handler;
 pub mod selection;
 pub mod sixel;

@@ -3565,6 +3565,8 @@ fn test_client_messages() {
     test_client_roundtrip!(ClientToServerMsg::HostTerminalThemeChanged {
         mode: HostTerminalThemeMode::Light,
     });
+    test_client_roundtrip!(ClientToServerMsg::KittyGraphicsSupport { supported: true });
+    test_client_roundtrip!(ClientToServerMsg::KittyGraphicsSupport { supported: false });
 }
 
 fn test_server_messages() {

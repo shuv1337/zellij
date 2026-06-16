@@ -327,6 +327,10 @@ impl InputHandler {
                 self.os_input
                     .send_to_server(ClientToServerMsg::HostTerminalThemeChanged { mode });
             },
+            AnsiStdinInstruction::KittyGraphics(supported) => {
+                self.os_input
+                    .send_to_server(ClientToServerMsg::KittyGraphicsSupport { supported });
+            },
         }
     }
     fn handle_mouse_event(&mut self, mouse_event: &MouseEvent) {

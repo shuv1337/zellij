@@ -11081,3 +11081,33 @@ fn exiting_mobile_releases_the_plugin_render() {
         "exiting mobile must release the plugin render; sent={sent:?}",
     );
 }
+
+#[test]
+fn kitty_graphics_any_client_aggregate() {
+    // Phase 1e: the inner `a=q` aggregate answers OK if *any* connected client's
+    // outer terminal supports Kitty. Mirrors a mixed session (e.g. a Kitty
+    // terminal + a web client).
+    let size = Size {
+        cols: 80,
+        rows: 24,
+    };
+    let mut screen = create_new_screen(size, true, true);
+
+    // No clients yet → unsupported.
+    assert!(!screen.any_client_supports_kitty());
+
+    // A client whose probe reported support → aggregate is true.
+    screen.set_outer_supports_kitty(1, true);
+    assert!(screen.any_client_supports_kitty());
+
+    // A second, non-supporting client (e.g. web) does not flip it back.
+    screen.set_outer_supports_kitty(2, false);
+    assert!(
+        screen.any_client_supports_kitty(),
+        "any supporting client is enough (others get a placeholder)"
+    );
+
+    // Once the supporting client's value is cleared, the aggregate drops.
+    screen.set_outer_supports_kitty(1, false);
+    assert!(!screen.any_client_supports_kitty());
+}

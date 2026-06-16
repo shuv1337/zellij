@@ -875,3 +875,110 @@ fn kitty_kbd_event_does_not_wedge_subsequent_forward_reply() {
         );
     }
 }
+
+// ===================================================================
+// Kitty graphics support probe (Phase 1d)
+// ===================================================================
+
+#[test]
+fn kitty_probe_resolves_supported_on_ok_apc_before_da() {
+    // Terminal speaks Kitty: it answers the a=q probe with an OK APC, then the DA.
+    let mut parser = StdinAnsiParser::new();
+    parser.expect_kitty_graphics_probe();
+    let (replies, residue) =
+        feed_once(&mut parser, b"\x1b_Gi=4294967295;OK\x1b\\\x1b[?62;c");
+    assert!(
+        replies.iter().any(|r| matches!(r, HostReply::KittyGraphics(true))),
+        "OK APC before DA must resolve supported; got {:?}",
+        replies
+    );
+    assert!(
+        !replies.iter().any(|r| matches!(r, HostReply::KittyGraphics(false))),
+        "must not also emit a negative result"
+    );
+    // Both the APC reply and the DA must be stripped from keyboard residue.
+    assert!(residue.is_empty(), "probe bytes must not leak to residue: {:?}", residue);
+}
+
+#[test]
+fn kitty_probe_resolves_unsupported_on_da_without_ok() {
+    // Terminal lacks Kitty: only the DA comes back, no OK APC.
+    let mut parser = StdinAnsiParser::new();
+    parser.expect_kitty_graphics_probe();
+    let (replies, _residue) = feed_once(&mut parser, b"\x1b[?62;c");
+    assert!(
+        replies.iter().any(|r| matches!(r, HostReply::KittyGraphics(false))),
+        "DA with no preceding OK APC must resolve unsupported; got {:?}",
+        replies
+    );
+}
+
+#[test]
+fn kitty_probe_ok_wins_when_in_same_chunk_as_da() {
+    // Stream order is the discriminator: OK APC precedes DA in one chunk.
+    let mut parser = StdinAnsiParser::new();
+    parser.expect_kitty_graphics_probe();
+    let (replies, _) = feed_once(&mut parser, b"\x1b_Gi=4294967295;OK\x1b\\\x1b[c");
+    assert_eq!(
+        replies.iter().filter(|r| matches!(r, HostReply::KittyGraphics(_))).count(),
+        1,
+        "exactly one kitty result"
+    );
+    assert!(replies.iter().any(|r| matches!(r, HostReply::KittyGraphics(true))));
+}
+
+#[test]
+fn kitty_probe_handles_c1_st_terminator() {
+    let mut parser = StdinAnsiParser::new();
+    parser.expect_kitty_graphics_probe();
+    // OK APC terminated by C1 ST (0x9c) instead of ESC backslash.
+    let (replies, _) = feed_once(&mut parser, b"\x1b_Gi=1;OK\x9c\x1b[c");
+    assert!(replies.iter().any(|r| matches!(r, HostReply::KittyGraphics(true))));
+}
+
+#[test]
+fn kitty_probe_apc_split_across_feeds() {
+    let mut parser = StdinAnsiParser::new();
+    parser.expect_kitty_graphics_probe();
+    // APC split mid-payload; must not resolve until the terminator arrives.
+    let (r1, _) = feed_once(&mut parser, b"\x1b_Gi=42;O");
+    assert!(r1.is_empty(), "incomplete APC must not resolve");
+    let (r2, _) = feed_once(&mut parser, b"K\x1b\\\x1b[c");
+    assert!(r2.iter().any(|r| matches!(r, HostReply::KittyGraphics(true))));
+}
+
+#[test]
+fn kitty_probe_inert_when_not_armed() {
+    // Without arming, a stray Kitty OK APC produces no KittyGraphics reply
+    // (but is still stripped from residue).
+    let mut parser = StdinAnsiParser::new();
+    let (replies, residue) = feed_once(&mut parser, b"\x1b_Gi=1;OK\x1b\\");
+    assert!(
+        !replies.iter().any(|r| matches!(r, HostReply::KittyGraphics(_))),
+        "unarmed parser must not emit a kitty result"
+    );
+    assert!(residue.is_empty(), "APC still stripped from residue: {:?}", residue);
+}
+
+#[test]
+fn kitty_probe_only_resolves_once() {
+    let mut parser = StdinAnsiParser::new();
+    parser.expect_kitty_graphics_probe();
+    let (r1, _) = feed_once(&mut parser, b"\x1b_Gi=1;OK\x1b\\");
+    assert!(r1.iter().any(|r| matches!(r, HostReply::KittyGraphics(true))));
+    // A subsequent DA must not produce a second (negative) result.
+    let (r2, _) = feed_once(&mut parser, b"\x1b[c");
+    assert!(
+        !r2.iter().any(|r| matches!(r, HostReply::KittyGraphics(_))),
+        "probe must resolve at most once; got {:?}",
+        r2
+    );
+}
+
+#[test]
+fn apc_reply_stripped_from_keyboard_residue_with_surrounding_text() {
+    // Normal typed text around an APC reply: the text survives, the APC is gone.
+    let mut parser = StdinAnsiParser::new();
+    let (_replies, residue) = feed_once(&mut parser, b"ab\x1b_Gi=9;OK\x1b\\cd");
+    assert_eq!(residue, b"abcd".to_vec(), "APC stripped, text preserved");
+}

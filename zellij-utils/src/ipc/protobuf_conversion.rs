@@ -8,7 +8,8 @@ use crate::{
         ForegroundColorMsg, ForwardQueryToHostMsg, ForwardedReplyFromHostMsg,
         HostTerminalThemeChangedMsg,
         HostTerminalThemeIndication as ProtoHostTerminalThemeIndication,
-        InputMode as ProtoInputMode, KeyMsg, KillSessionMsg, LayoutMetadata as ProtoLayoutMetadata,
+        InputMode as ProtoInputMode, KeyMsg, KillSessionMsg, KittyGraphicsSupportMsg,
+        LayoutMetadata as ProtoLayoutMetadata,
         LogErrorMsg, LogMsg, PaneMetadata as ProtoPaneMetadata, PaneRenderUpdateMsg,
         QueryTerminalSizeMsg, RenamedSessionMsg, RenderMsg, ResizeCause as ProtoResizeCause,
         ServerToClientMsg as ProtoServerToClientMsg, SetSoftKeyboardMsg,
@@ -153,6 +154,11 @@ impl From<ClientToServerMsg> for ProtoClientToServerMsg {
                 client_to_server_msg::Message::SoftKeyboardVisibilityChanged(
                     SoftKeyboardVisibilityChangedMsg { visible },
                 )
+            },
+            ClientToServerMsg::KittyGraphicsSupport { supported } => {
+                client_to_server_msg::Message::KittyGraphicsSupport(KittyGraphicsSupportMsg {
+                    supported,
+                })
             },
         };
 
@@ -302,6 +308,11 @@ impl TryFrom<ProtoClientToServerMsg> for ClientToServerMsg {
             Some(client_to_server_msg::Message::SoftKeyboardVisibilityChanged(msg)) => {
                 Ok(ClientToServerMsg::SoftKeyboardVisibilityChanged {
                     visible: msg.visible,
+                })
+            },
+            Some(client_to_server_msg::Message::KittyGraphicsSupport(msg)) => {
+                Ok(ClientToServerMsg::KittyGraphicsSupport {
+                    supported: msg.supported,
                 })
             },
             None => Err(anyhow!("Empty ClientToServerMsg message")),

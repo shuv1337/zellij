@@ -68,6 +68,13 @@ members = [
     ".",
 ]
 
+# zellij-vte-apc fork: patches vte 0.11.0 to surface APC (`ESC _ … ST`) sequences
+# to `Perform::apc_dispatch`, the prerequisite for Kitty graphics support.
+# See PHASE0_VTE_PATCH.md and vendor/vte-apc/FORK_NOTES.md. Only the 0.11.0
+# version line repoints; the transitive vte 0.10.1 stays on the registry.
+[patch.crates-io]
+vte = { path = "vendor/vte-apc" }
+
 [workspace.package]
 edition = "2021"
 license = "MIT"

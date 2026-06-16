@@ -61,6 +61,10 @@ pub enum HostReply {
     /// DSR 997 reply / unsolicited notification reporting the host
     /// terminal's color-palette theme mode (CSI 2031).
     HostTerminalThemeChanged(HostTerminalThemeMode),
+    /// Outcome of the startup Kitty graphics support probe: `true` if the host
+    /// terminal answered the `a=q` APC with OK before the trailing Primary-DA
+    /// barrier, `false` if the DA arrived first (negative detection).
+    KittyGraphics(bool),
 }
 
 /// Retained alias for the pre-refactor type name used by other modules in
@@ -232,6 +236,24 @@ pub struct StdinAnsiParser {
     partial_osc: Vec<u8>,
     /// Same for CSI device-control reports.
     partial_csi: Vec<u8>,
+    /// Same for APC sequences (Kitty graphics replies), so a complete APC is
+    /// stripped from keyboard residue even when split across feed() calls.
+    partial_apc: Vec<u8>,
+    /// State of the startup Kitty graphics support probe (negative detection via
+    /// the trailing Primary-DA barrier).
+    kitty_probe: KittyProbeState,
+    /// Partial buffer for the probe pre-scan (separate from `partial_apc`, which
+    /// owns residue stripping). Only accumulates during the probe window.
+    partial_kitty_probe: Vec<u8>,
+}
+
+/// State machine for the one-shot startup Kitty graphics probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KittyProbeState {
+    /// Not probing (before arming, or after the result has been emitted).
+    Idle,
+    /// Probe sent; awaiting either the Kitty `OK` APC or the Primary-DA barrier.
+    Pending,
 }
 
 impl std::fmt::Debug for StdinAnsiParser {
@@ -240,6 +262,8 @@ impl std::fmt::Debug for StdinAnsiParser {
             .field("active_forward", &self.active_forward)
             .field("partial_osc_len", &self.partial_osc.len())
             .field("partial_csi_len", &self.partial_csi.len())
+            .field("partial_apc_len", &self.partial_apc.len())
+            .field("kitty_probe", &self.kitty_probe)
             .finish()
     }
 }
@@ -251,6 +275,9 @@ impl StdinAnsiParser {
             active_forward: None,
             partial_osc: Vec::new(),
             partial_csi: Vec::new(),
+            partial_apc: Vec::new(),
+            kitty_probe: KittyProbeState::Idle,
+            partial_kitty_probe: Vec::new(),
         }
     }
 
@@ -307,6 +334,85 @@ impl StdinAnsiParser {
         self.active_forward.as_ref().map(|s| s.token)
     }
 
+    /// Arm the one-shot Kitty graphics support probe. Call once at startup,
+    /// right after writing the probe query
+    /// (`ESC _ Gi=…,a=q… ESC \` immediately followed by `ESC [ c`). The next
+    /// stream resolves it in order: a Kitty `OK` APC seen before the Primary-DA
+    /// barrier emits `HostReply::KittyGraphics(true)`; the DA arriving first
+    /// emits `HostReply::KittyGraphics(false)` (negative detection). If neither
+    /// is seen the probe simply never resolves and the server keeps its default
+    /// (unsupported) — the conservative fallback.
+    pub fn expect_kitty_graphics_probe(&mut self) {
+        self.kitty_probe = KittyProbeState::Pending;
+        self.partial_kitty_probe.clear();
+    }
+
+    /// While the probe is pending, walk `bytes` (with any buffered partial) in
+    /// stream order, returning the first resolving reply. A conformant terminal
+    /// emits the Kitty OK APC *before* the trailing DA, so stream order is the
+    /// discriminator. NOTE: this ordering is the documented Kitty recommendation
+    /// but is not guaranteed across terminals — see GOAL-kitty-graphics.md; it
+    /// wants verification against ghostty/wezterm/foot, not just kitty.
+    fn scan_kitty_probe(&mut self, bytes: &[u8]) -> Option<HostReply> {
+        if self.kitty_probe != KittyProbeState::Pending {
+            return None;
+        }
+        let mut working = std::mem::take(&mut self.partial_kitty_probe);
+        working.extend_from_slice(bytes);
+        let mut i = 0;
+        while i < working.len() {
+            let rest = &working[i..];
+            // Kitty OK APC → positive resolution.
+            if rest.len() >= 2 && rest[0] == 0x1b && rest[1] == b'_' {
+                match apc_status(rest) {
+                    SeqStatus::Complete(len) => {
+                        if apc_is_kitty_ok(&rest[..len]) {
+                            self.kitty_probe = KittyProbeState::Idle;
+                            return Some(HostReply::KittyGraphics(true));
+                        }
+                        i += len;
+                        continue;
+                    },
+                    SeqStatus::NeedMore => {
+                        if rest.len() <= PARTIAL_BUFFER_CAP_BYTES {
+                            self.partial_kitty_probe = rest.to_vec();
+                        }
+                        return None;
+                    },
+                    SeqStatus::Malformed => {
+                        i += 1;
+                        continue;
+                    },
+                }
+            }
+            // Primary-DA barrier (`ESC [ … c`) → negative resolution.
+            if rest.len() >= 2 && rest[0] == 0x1b && rest[1] == b'[' {
+                match csi_status(rest) {
+                    SeqStatus::Complete(len) => {
+                        if rest.get(len - 1) == Some(&b'c') {
+                            self.kitty_probe = KittyProbeState::Idle;
+                            return Some(HostReply::KittyGraphics(false));
+                        }
+                        i += len;
+                        continue;
+                    },
+                    SeqStatus::NeedMore => {
+                        if rest.len() <= PARTIAL_BUFFER_CAP_BYTES {
+                            self.partial_kitty_probe = rest.to_vec();
+                        }
+                        return None;
+                    },
+                    SeqStatus::Malformed => {
+                        i += 1;
+                        continue;
+                    },
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Consume a chunk of raw stdin bytes. Returns classified host replies
     /// (to be dispatched to the server's cached-state consumers), at most
     /// one completed forwarded reply (barrier closed the window), and the
@@ -314,6 +420,11 @@ impl StdinAnsiParser {
     /// are the bytes the caller should feed to the keyboard parser.
     pub fn feed(&mut self, bytes: &[u8]) -> ParseOutput {
         let mut out = ParseOutput::default();
+        // Resolve the startup Kitty probe first, in stream order, so an OK APC
+        // that precedes the DA in this same chunk wins over the DA barrier.
+        if let Some(reply) = self.scan_kitty_probe(bytes) {
+            out.replies.push(reply);
+        }
         // Collect events first (borrow-splits the InputParser across the
         // callback and the post-processing mutations).
         let mut events = Vec::new();
@@ -394,7 +505,9 @@ impl StdinAnsiParser {
         // rather than leaking into residue.
         residue.extend(self.strip_replies(bytes));
         out.residue = residue;
-        out.has_partial_state = !self.partial_osc.is_empty() || !self.partial_csi.is_empty();
+        out.has_partial_state = !self.partial_osc.is_empty()
+            || !self.partial_csi.is_empty()
+            || !self.partial_apc.is_empty();
         out
     }
 
@@ -405,9 +518,12 @@ impl StdinAnsiParser {
     /// keyboard parser instead of being stuck forever waiting for a
     /// disambiguating byte that is never coming.
     pub fn finalize(&mut self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.partial_osc.len() + self.partial_csi.len());
+        let mut out = Vec::with_capacity(
+            self.partial_osc.len() + self.partial_csi.len() + self.partial_apc.len(),
+        );
         out.append(&mut self.partial_osc);
         out.append(&mut self.partial_csi);
+        out.append(&mut self.partial_apc);
         out
     }
 
@@ -423,13 +539,18 @@ impl StdinAnsiParser {
     /// for the rest of the sequence.
     fn strip_replies(&mut self, bytes: &[u8]) -> Vec<u8> {
         // Prepend any pending partial. At most one of (partial_osc,
-        // partial_csi) is non-empty at any time — the previous walk
-        // either completed all sequences or stopped at exactly one
+        // partial_csi, partial_apc) is non-empty at any time — the previous
+        // walk either completed all sequences or stopped at exactly one
         // unterminated tail.
-        let mut working: Vec<u8> =
-            Vec::with_capacity(self.partial_osc.len() + self.partial_csi.len() + bytes.len());
+        let mut working: Vec<u8> = Vec::with_capacity(
+            self.partial_osc.len()
+                + self.partial_csi.len()
+                + self.partial_apc.len()
+                + bytes.len(),
+        );
         working.append(&mut self.partial_osc);
         working.append(&mut self.partial_csi);
+        working.append(&mut self.partial_apc);
         working.extend_from_slice(bytes);
 
         let mut out = Vec::with_capacity(working.len());
@@ -486,8 +607,32 @@ impl StdinAnsiParser {
                     },
                 }
             }
+            // APC: ESC _ ... ST  (Kitty graphics replies). Strip so the OK
+            // reply never reaches the keyboard parser as spurious keypresses.
+            if rest.len() >= 2 && rest[0] == 0x1b && rest[1] == b'_' {
+                match apc_status(rest) {
+                    SeqStatus::Complete(len) => {
+                        i += len;
+                        continue;
+                    },
+                    SeqStatus::NeedMore => {
+                        let tail = rest.to_vec();
+                        if tail.len() > PARTIAL_BUFFER_CAP_BYTES {
+                            out.extend_from_slice(&tail);
+                        } else {
+                            self.partial_apc = tail;
+                        }
+                        return out;
+                    },
+                    SeqStatus::Malformed => {
+                        out.push(working[i]);
+                        i += 1;
+                        continue;
+                    },
+                }
+            }
             // Lone trailing ESC at the tail — could be the start of
-            // either OSC or CSI; the next byte will disambiguate. Buffer
+            // OSC, CSI, or APC; the next byte will disambiguate. Buffer
             // it under partial_osc by convention; the next call's
             // walker re-routes based on the actual second byte.
             if rest.len() == 1 && rest[0] == 0x1b {
@@ -550,6 +695,41 @@ fn csi_status(buf: &[u8]) -> SeqStatus {
     } else {
         SeqStatus::NeedMore
     }
+}
+
+/// Walk an APC sequence (`ESC _ … ST`) at the head of `buf`. APC terminates only
+/// with ST — either `ESC \` or the C1 byte `0x9c` (no BEL, unlike OSC).
+fn apc_status(buf: &[u8]) -> SeqStatus {
+    if buf.get(0) != Some(&0x1b) || buf.get(1) != Some(&b'_') {
+        return SeqStatus::Malformed;
+    }
+    let mut i = 2;
+    while i < buf.len() {
+        match buf[i] {
+            0x9c => return SeqStatus::Complete(i + 1), // C1 ST
+            0x1b => match buf.get(i + 1) {
+                Some(&b'\\') => return SeqStatus::Complete(i + 2),
+                Some(_) => return SeqStatus::Malformed,
+                None => return SeqStatus::NeedMore,
+            },
+            _ => i += 1,
+        }
+    }
+    SeqStatus::NeedMore
+}
+
+/// Whether a complete APC sequence is a Kitty graphics OK reply
+/// (`ESC _ G…;OK ST`). `seq` includes the `ESC _` prefix and the ST terminator.
+fn apc_is_kitty_ok(seq: &[u8]) -> bool {
+    let body = &seq[2.min(seq.len())..];
+    let payload = if body.ends_with(b"\x1b\\") {
+        &body[..body.len() - 2]
+    } else if body.last() == Some(&0x9c) {
+        &body[..body.len() - 1]
+    } else {
+        body
+    };
+    payload.first() == Some(&b'G') && payload.windows(3).any(|w| w == b";OK")
 }
 
 // =====================================================================

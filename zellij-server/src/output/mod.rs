@@ -202,7 +202,11 @@ fn serialize_chunks(
     styled_underlines: bool,
     osc8_hyperlinks: bool,
     max_size: Option<Size>,
-) -> Result<String> {
+    // Kitty: the visible chunks, and (render-state, client id) when the client's
+    // outer terminal supports Kitty. `None` render-state => gate to placeholder.
+    kitty_chunks: Option<&Vec<KittyImageChunk>>,
+    kitty_render: Option<(&mut crate::panes::kitty::KittyRenderState, u16)>,
+) -> Result<SerializedChunks> {
     let err_context = || "failed to serialize input chunks".to_string();
 
     let mut vte_output = String::new();
@@ -286,6 +290,48 @@ fn serialize_chunks(
             }
         }
     }
+    // Kitty graphics: emit transmit-once + placement per visible chunk, gated on
+    // per-client outer-terminal support. Appended to the same image-vte block as
+    // sixel so it inherits the post-text z-order (images above text).
+    //
+    // `emitted_frame` records exactly the (source image -> placement ids) that
+    // survive `max_size` filtering here, so the caller reconciles against what
+    // was actually rendered. Building it from the unfiltered `kitty_chunks`
+    // would leave a placement cropped out by a watcher's smaller `max_size`
+    // recorded as live, suppressing its delete and ghosting it on the outer
+    // terminal.
+    let mut emitted_frame: HashMap<u32, HashSet<u32>> = HashMap::new();
+    if let (Some(kitty_chunks), Some((render_state, client_id))) = (kitty_chunks, kitty_render) {
+        for chunk in kitty_chunks {
+            if let Some(size) = max_size {
+                if chunk.cell_y >= size.rows || chunk.cell_x >= size.cols {
+                    continue;
+                }
+            }
+            emitted_frame
+                .entry(chunk.source_image_id)
+                .or_default()
+                .insert(chunk.placement_id);
+            let image_vte = sixel_vte.get_or_insert_with(String::new);
+            vte_goto_instruction(chunk.cell_x, chunk.cell_y, image_vte)
+                .with_context(err_context)?;
+            let spec = crate::panes::kitty::KittyChunkSpec {
+                source_image_id: chunk.source_image_id,
+                placement_id: chunk.placement_id,
+                format: chunk.format,
+                compressed: chunk.compressed,
+                full_width: chunk.full_width,
+                full_height: chunk.full_height,
+                src_x: chunk.src_x,
+                src_y: chunk.src_y,
+                src_width: chunk.src_width,
+                src_height: chunk.src_height,
+                payload_b64: chunk.payload_b64.clone(),
+            };
+            let bytes = render_state.render_chunk_bytes(client_id, &spec);
+            image_vte.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
     if let Some(ref sixel_vte) = sixel_vte {
         // we do this at the end because of the implied z-index,
         // images should be above text unless the text was explicitly inserted after them (the
@@ -296,7 +342,20 @@ fn serialize_chunks(
         vte_output.push_str(sixel_vte);
         vte_output.push_str(restore_cursor_position);
     }
-    Ok(vte_output)
+    Ok(SerializedChunks {
+        vte_output,
+        kitty_frame: emitted_frame,
+    })
+}
+
+/// Result of [`serialize_chunks`]: the serialized VTE bytes plus the Kitty
+/// placement frame (source image id -> placement ids) that was actually emitted
+/// after `max_size` filtering. The caller feeds `kitty_frame` to
+/// `KittyRenderState::reconcile_placements` so stale placements are deleted from
+/// the outer terminal.
+struct SerializedChunks {
+    vte_output: String,
+    kitty_frame: HashMap<u32, HashSet<u32>>,
 }
 
 type AbsoluteMiddleStart = usize;
@@ -356,6 +415,15 @@ pub struct Output {
     post_vte_instructions: HashMap<ClientId, Vec<String>>,
     client_character_chunks: HashMap<ClientId, Vec<CharacterChunk>>,
     sixel_chunks: HashMap<ClientId, Vec<SixelImageChunk>>,
+    kitty_chunks: HashMap<ClientId, Vec<KittyImageChunk>>,
+    /// Per-client Kitty source image ids to delete from the outer terminal this
+    /// render (reaped / explicitly `a=d`-deleted images).
+    kitty_deletions: HashMap<ClientId, Vec<u32>>,
+    /// Per-client outer-terminal Kitty support snapshot for this render (set by
+    /// `Screen` before serialize). Clients absent / false get no Kitty bytes.
+    outer_supports_kitty: HashMap<ClientId, bool>,
+    /// Durable, per-client transmit-once state shared with `Screen`.
+    kitty_render_state: Rc<RefCell<crate::panes::kitty::KittyRenderState>>,
     link_handler: Option<Rc<RefCell<LinkHandler>>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
@@ -373,13 +441,77 @@ impl Output {
         character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
         styled_underlines: bool,
         osc8_hyperlinks: bool,
+        kitty_render_state: Rc<RefCell<crate::panes::kitty::KittyRenderState>>,
     ) -> Self {
         Output {
             sixel_image_store,
             character_cell_size,
             styled_underlines,
             osc8_hyperlinks,
+            kitty_render_state,
             ..Default::default()
+        }
+    }
+
+    /// Snapshot per-client Kitty support for this render (called by `Screen`).
+    pub fn set_outer_kitty_support(&mut self, support: HashMap<ClientId, bool>) {
+        self.outer_supports_kitty = support;
+    }
+
+    pub fn add_kitty_image_chunks_to_client(
+        &mut self,
+        client_id: ClientId,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        z_index: Option<usize>,
+    ) {
+        if kitty_image_chunks.is_empty() {
+            return;
+        }
+        // Clip around covering floating panes (mirrors the sixel path) so a
+        // covered tiled-pane image cannot draw over a floating pane.
+        let visible = if let (Some(stack), Some(cell_size)) = (
+            &self.floating_panes_stack,
+            *self.character_cell_size.borrow(),
+        ) {
+            stack.visible_kitty_image_chunks(kitty_image_chunks, z_index, &cell_size)
+        } else {
+            kitty_image_chunks
+        };
+        if visible.is_empty() {
+            return;
+        }
+        let entry = self.kitty_chunks.entry(client_id).or_insert_with(Vec::new);
+        entry.extend(visible);
+    }
+
+    pub fn add_kitty_image_chunks_to_multiple_clients(
+        &mut self,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        client_ids: impl Iterator<Item = ClientId>,
+        z_index: Option<usize>,
+    ) {
+        for client_id in client_ids {
+            self.add_kitty_image_chunks_to_client(
+                client_id,
+                kitty_image_chunks.clone(),
+                z_index,
+            );
+        }
+    }
+
+    pub fn add_kitty_deletions_to_multiple_clients(
+        &mut self,
+        deleted_image_ids: Vec<u32>,
+        client_ids: impl Iterator<Item = ClientId>,
+    ) {
+        if deleted_image_ids.is_empty() {
+            return;
+        }
+        for client_id in client_ids {
+            self.kitty_deletions
+                .entry(client_id)
+                .or_insert_with(Vec::new)
+                .extend(deleted_image_ids.iter().copied());
         }
     }
     pub fn add_clients(
@@ -535,18 +667,59 @@ impl Output {
             }
 
             // append the actual vte
-            client_serialized_render_instructions.push_str(
-                &serialize_chunks(
-                    client_character_chunks,
-                    self.sixel_chunks.get(&client_id),
-                    self.link_handler.as_mut(),
-                    Some(&mut self.sixel_image_store.borrow_mut()),
-                    self.styled_underlines,
-                    self.osc8_hyperlinks,
-                    None, // No size constraints for regular rendering
-                )
-                .with_context(err_context)?,
-            ); // TODO: less allocations?
+            let kitty_supported = self
+                .outer_supports_kitty
+                .get(&client_id)
+                .copied()
+                .unwrap_or(false);
+            let mut kitty_state = self.kitty_render_state.borrow_mut();
+            // Delete reaped / explicitly-deleted images from the outer terminal
+            // first (before re-placing surviving ones).
+            if let Some(deletions) = self.kitty_deletions.remove(&client_id) {
+                for source_id in deletions {
+                    if let Some(outer_id) = kitty_state.take_outer_id(client_id, source_id) {
+                        if kitty_supported {
+                            client_serialized_render_instructions.push_str(
+                                &String::from_utf8_lossy(
+                                    &crate::panes::kitty::KittyRenderState::delete_image_bytes(
+                                        outer_id,
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            let kitty_render = if kitty_supported {
+                Some((&mut *kitty_state, client_id))
+            } else {
+                None
+            };
+            let serialized = serialize_chunks(
+                client_character_chunks,
+                self.sixel_chunks.get(&client_id),
+                self.link_handler.as_mut(),
+                Some(&mut self.sixel_image_store.borrow_mut()),
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                None, // No size constraints for regular rendering
+                self.kitty_chunks.get(&client_id),
+                kitty_render,
+            )
+            .with_context(err_context)?;
+            client_serialized_render_instructions.push_str(&serialized.vte_output); // TODO: less allocations?
+            // Reconcile placements: delete any that were live last frame but are
+            // gone now (coverage grew / scrolled out), so they don't ghost.
+            // Reconcile against the frame that was actually emitted (post-filter).
+            if kitty_supported {
+                let stale =
+                    kitty_state.reconcile_placements(client_id, &serialized.kitty_frame);
+                if !stale.is_empty() {
+                    client_serialized_render_instructions
+                        .push_str(&String::from_utf8_lossy(&stale));
+                }
+            }
+            drop(kitty_state);
 
             // append post-vte instructions for this client
             if let Some(post_vte_instructions_for_client) =
@@ -603,18 +776,57 @@ impl Output {
             }
 
             // append the actual vte with size constraints
-            client_serialized_render_instructions.push_str(
-                &serialize_chunks(
-                    client_character_chunks,
-                    self.sixel_chunks.get(&client_id),
-                    self.link_handler.as_mut(),
-                    Some(&mut self.sixel_image_store.borrow_mut()),
-                    self.styled_underlines,
-                    self.osc8_hyperlinks,
-                    max_size,
-                )
-                .with_context(err_context)?,
-            );
+            let kitty_supported = self
+                .outer_supports_kitty
+                .get(&client_id)
+                .copied()
+                .unwrap_or(false);
+            let mut kitty_state = self.kitty_render_state.borrow_mut();
+            if let Some(deletions) = self.kitty_deletions.remove(&client_id) {
+                for source_id in deletions {
+                    if let Some(outer_id) = kitty_state.take_outer_id(client_id, source_id) {
+                        if kitty_supported {
+                            client_serialized_render_instructions.push_str(
+                                &String::from_utf8_lossy(
+                                    &crate::panes::kitty::KittyRenderState::delete_image_bytes(
+                                        outer_id,
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            let kitty_render = if kitty_supported {
+                Some((&mut *kitty_state, client_id))
+            } else {
+                None
+            };
+            let serialized = serialize_chunks(
+                client_character_chunks,
+                self.sixel_chunks.get(&client_id),
+                self.link_handler.as_mut(),
+                Some(&mut self.sixel_image_store.borrow_mut()),
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                max_size,
+                self.kitty_chunks.get(&client_id),
+                kitty_render,
+            )
+            .with_context(err_context)?;
+            client_serialized_render_instructions.push_str(&serialized.vte_output);
+            // Reconcile against the frame that was actually emitted (post-`max_size`
+            // filter), so a placement cropped out by a watcher's smaller size is
+            // deleted from the outer terminal instead of ghosting.
+            if kitty_supported {
+                let stale =
+                    kitty_state.reconcile_placements(client_id, &serialized.kitty_frame);
+                if !stale.is_empty() {
+                    client_serialized_render_instructions
+                        .push_str(&String::from_utf8_lossy(&stale));
+                }
+            }
+            drop(kitty_state);
 
             // append post-vte instructions for this client
             if let Some(post_vte_instructions_for_client) =
@@ -645,11 +857,15 @@ impl Output {
             || !self.post_vte_instructions.is_empty()
             || self.client_character_chunks.values().any(|c| !c.is_empty())
             || self.sixel_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_deletions.values().any(|c| !c.is_empty())
     }
     pub fn has_rendered_assets(&self) -> bool {
         // pre_vte and post_vte are not considered rendered assets as they should not be visible
         self.client_character_chunks.values().any(|c| !c.is_empty())
             || self.sixel_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_chunks.values().any(|c| !c.is_empty())
+            || self.kitty_deletions.values().any(|c| !c.is_empty())
     }
     pub fn cursor_is_visible(
         &mut self,
@@ -761,6 +977,54 @@ impl FloatingPanesStack {
             }
         }
         chunks_to_check
+    }
+
+    /// Clip Kitty image chunks around covering floating panes, mirroring
+    /// `visible_sixel_image_chunks`. The chunk geometry maps 1:1 onto a sixel
+    /// chunk (cell position + source crop), so we reuse the tested
+    /// `remove_covered_sixel_parts` splitting and map the visible sub-rects back
+    /// to Kitty chunks. Each surviving sub-rect becomes its own placement of the
+    /// same source image (distinct `placement_id`); stale placements left when
+    /// coverage shrinks are reconciled away in `serialize`.
+    pub fn visible_kitty_image_chunks(
+        &self,
+        kitty_image_chunks: Vec<KittyImageChunk>,
+        z_index: Option<usize>,
+        character_cell_size: &SizeInPixels,
+    ) -> Vec<KittyImageChunk> {
+        let mut out = Vec::new();
+        for original in kitty_image_chunks {
+            let as_sixel = SixelImageChunk {
+                cell_x: original.cell_x,
+                cell_y: original.cell_y,
+                sixel_image_pixel_x: original.src_x,
+                sixel_image_pixel_y: original.src_y,
+                sixel_image_pixel_width: original.src_width,
+                sixel_image_pixel_height: original.src_height,
+                sixel_image_id: 0, // unused; geometry only
+            };
+            let visible_parts =
+                self.visible_sixel_image_chunks(vec![as_sixel], z_index, character_cell_size);
+            for (i, part) in visible_parts.into_iter().enumerate() {
+                out.push(KittyImageChunk {
+                    cell_x: part.cell_x,
+                    cell_y: part.cell_y,
+                    source_image_id: original.source_image_id,
+                    // Distinct placement id per visible sub-rect of this image.
+                    placement_id: original.placement_id.wrapping_mul(1000) + i as u32,
+                    format: original.format,
+                    compressed: original.compressed,
+                    full_width: original.full_width,
+                    full_height: original.full_height,
+                    src_x: part.sixel_image_pixel_x,
+                    src_y: part.sixel_image_pixel_y,
+                    src_width: part.sixel_image_pixel_width,
+                    src_height: part.sixel_image_pixel_height,
+                    payload_b64: original.payload_b64.clone(),
+                });
+            }
+        }
+        out
     }
     fn remove_covered_parts(
         &self,
@@ -1031,6 +1295,33 @@ pub struct SixelImageChunk {
     pub sixel_image_pixel_width: usize,
     pub sixel_image_pixel_height: usize,
     pub sixel_image_id: usize,
+}
+
+/// One visible Kitty image placement to render to a client's outer terminal.
+/// Self-contained (carries the base64 payload) so the serialize step needs no
+/// shared image store — only the per-client
+/// [`crate::panes::kitty::KittyRenderState`].
+#[derive(Debug, Clone)]
+pub struct KittyImageChunk {
+    /// Viewport cell position to place at.
+    pub cell_x: usize,
+    pub cell_y: usize,
+    /// Source app image id and this placement's id.
+    pub source_image_id: u32,
+    pub placement_id: u32,
+    /// Kitty `f=` format (24/32/100) and `o=z` compression flag.
+    pub format: u32,
+    pub compressed: bool,
+    /// Full source image pixel dims (for the one-time transmit of raw formats).
+    pub full_width: usize,
+    pub full_height: usize,
+    /// Source crop (px) within the image — handles partial scroll / clipping.
+    pub src_x: usize,
+    pub src_y: usize,
+    pub src_width: usize,
+    pub src_height: usize,
+    /// Undecoded base64 payload for the one-time transmit.
+    pub payload_b64: Vec<u8>,
 }
 
 impl CharacterChunk {

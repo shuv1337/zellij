@@ -4562,7 +4562,7 @@ fn osc_11_set_bg_produces_ansi_in_render_output() {
     let render_result = grid.render(0, 0, &style).unwrap();
     assert!(render_result.is_some(), "Expected render output");
 
-    let (chunks, _, _) = render_result.unwrap();
+    let (chunks, _, _, _) = render_result.unwrap();
     assert!(!chunks.is_empty(), "Expected at least one character chunk");
 
     // All chunks should carry the pane default bg
@@ -5632,7 +5632,7 @@ fn scroll_region_newline_bg_color_used_for_trailing_padding() {
     let content = b"\x1b[48;2;26;26;26m\x1b[1;5rAAA\r\nBBB\r\nCCC\r\nDDD\r\nEEE\r\nhi";
     let mut grid = create_grid_with_size_and_raw(10, 40, content);
     // read_changes returns character chunks with padding applied
-    let (chunks, _) = grid.read_changes(0, 0);
+    let (chunks, _, _) = grid.read_changes(0, 0);
     // Find the chunk for row 4 (the scroll-created row with "hi")
     let row_4_chunk = chunks.iter().find(|c| c.y == 4).expect("row 4 chunk");
     // The trailing padding character (last column) should have the row's bg_color
@@ -6101,4 +6101,186 @@ fn csi_5n_status_query_still_handled_locally() {
         vec![b"\x1b[0n".to_vec()],
         "DSR 5 must still produce its local 'all good' reply"
     );
+}
+
+#[test]
+fn kitty_a_q_pushes_kitty_graphics_query_to_forwarded_queries() {
+    use crate::host_query::HostQuery;
+    use crate::panes::kitty::KittyQuery;
+    // A Kitty graphics support probe arrives as an APC sequence
+    // (`ESC _ G … a=q … ST`). The vendored vte fork surfaces it to
+    // `Grid::apc_dispatch`, which must enrol it on the forwarded-query
+    // pipeline so Screen answers locally and in stream order.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Gi=31,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(
+        grid.pending_forwarded_queries,
+        vec![HostQuery::KittyGraphics(KittyQuery {
+            id: Some(31),
+            image_number: None,
+            quiet: 0,
+        })],
+        "Kitty a=q must enrol HostQuery::KittyGraphics for Screen to short-circuit"
+    );
+    assert!(
+        grid.pending_messages_to_pty.is_empty(),
+        "Grid must NOT answer the Kitty probe locally — Screen owns capability gating"
+    );
+}
+
+#[test]
+fn non_g_apc_is_ignored_by_grid() {
+    // SOS (`ESC X`) and PM (`ESC ^`) collapse onto vte's APC state and reach
+    // `apc_dispatch` too; the leading-`G` gate must drop them (and any non-Kitty
+    // APC) without enrolling a query.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Zsome-other-apc\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    for byte in b"\x1bXa-sos-string\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(
+        grid.pending_forwarded_queries.is_empty(),
+        "non-`G` APC / SOS must not enrol a forwarded query"
+    );
+}
+
+#[test]
+fn kitty_transmit_command_does_not_enrol_a_query() {
+    // A transmit/display command (`a=T`) is a Store, not a Query: it must not
+    // land on the forwarded-query pipeline.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(
+        grid.pending_forwarded_queries.is_empty(),
+        "a=T transmit must not enrol a forwarded query"
+    );
+}
+
+#[test]
+fn kitty_transmit_and_display_stores_anchors_and_advances_cursor() {
+    // `new_grid_for_forwarding_test` has a known cell size of 8x16 px, so
+    // anchoring fires. A 16x32 px image at cursor (0,0) anchors at pixel rect
+    // {x:0, y:0, width:16, height:32} and advances the cursor by 32/16 = 2 rows.
+    use crate::panes::sixel::PixelRect;
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=16,v=32,i=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 1, "image must be stored");
+    assert_eq!(grid.kitty_grid.image_dimensions(1), Some((16, 32)));
+    let placements = grid.kitty_grid.placements();
+    assert_eq!(placements.len(), 1, "a=T must anchor exactly one placement");
+    assert_eq!(placements[0].image_id, 1);
+    assert_eq!(placements[0].rect, PixelRect::new(0, 0, 32, 16));
+    assert_eq!(
+        grid.cursor_coordinates().map(|(_, y, _)| y),
+        Some(2),
+        "cursor must advance by ceil(32/16) = 2 rows"
+    );
+}
+
+#[test]
+fn kitty_delete_removes_image_and_queues_outer_deletion() {
+    // Store an image, then delete it via `a=d`. The grid drops it and queues the
+    // source id for outer-terminal teardown.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=8,v=16,i=2;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 1);
+    for byte in b"\x1b_Ga=d,d=i,i=2\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 0, "image removed on a=d");
+    assert!(grid.kitty_grid.placements().is_empty());
+    assert_eq!(
+        grid.drain_kitty_deletions(),
+        vec![2],
+        "deleted source id queued for outer-terminal teardown"
+    );
+}
+
+#[test]
+fn kitty_alt_screen_swaps_images_and_queues_deletions() {
+    // Entering the alternate screen must hide primary-screen Kitty images: the
+    // active grid becomes fresh (no images) and the primary's images are queued
+    // for outer-terminal deletion. Exiting restores them.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=8,v=16,i=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 1);
+
+    for byte in b"\x1b[?1049h" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(
+        grid.kitty_grid.image_count(),
+        0,
+        "alternate screen starts with no Kitty images"
+    );
+    assert_eq!(
+        grid.drain_kitty_deletions(),
+        vec![1],
+        "primary image queued for outer-terminal deletion on alt-screen enter"
+    );
+
+    for byte in b"\x1b[?1049l" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(
+        grid.kitty_grid.image_count(),
+        1,
+        "primary Kitty image restored on alt-screen exit"
+    );
+}
+
+#[test]
+fn kitty_text_over_image_reaps_placement() {
+    // Drawing a character over an image cell reaps the placement (Kitty can't be
+    // hole-punched like sixel) and queues the outer-terminal delete.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=8,v=16,i=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.placements().len(), 1);
+    // Cursor home, then write a character over the image's cell.
+    for byte in b"\x1b[HX" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(
+        grid.kitty_grid.placements().is_empty(),
+        "text over the image reaps the placement"
+    );
+    assert_eq!(grid.drain_kitty_deletions(), vec![1]);
+}
+
+#[test]
+fn kitty_transmit_only_stores_without_placement() {
+    // `a=t` (transmit-only) stores the image but anchors no placement and does
+    // not move the cursor.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=t,f=32,s=8,v=16,i=4;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(grid.kitty_grid.stored_image(4).is_some(), "image must be stored");
+    assert!(
+        grid.kitty_grid.placements().is_empty(),
+        "transmit-only must not anchor a placement"
+    );
+    assert_eq!(grid.cursor_coordinates().map(|(_, y, _)| y), Some(0));
 }

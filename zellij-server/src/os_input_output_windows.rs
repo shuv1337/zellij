@@ -174,7 +174,7 @@ fn build_command_line(cmd: &RunCommand) -> Vec<u16> {
 fn build_environment_block(terminal_id: u32) -> Vec<u16> {
     let mut block: Vec<u16> = Vec::new();
     for (key, value) in std::env::vars() {
-        if key == "ZELLIJ_PANE_ID" {
+        if key == "ZELLIJ_PANE_ID" || key == "ZELLIJ_GRAPHICS" {
             continue;
         }
         let entry = format!("{}={}", key, value);
@@ -183,6 +183,11 @@ fn build_environment_block(terminal_id: u32) -> Vec<u16> {
     }
     let pane_entry = format!("ZELLIJ_PANE_ID={}", terminal_id);
     block.extend(OsStr::new(&pane_entry).encode_wide());
+    block.push(0);
+    // Static capability hint (see the Unix path for rationale). Windows ships no
+    // Kitty render path in v1, but the env hint is set uniformly; runtime `a=q`
+    // detection remains the source of truth.
+    block.extend(OsStr::new("ZELLIJ_GRAPHICS=kitty").encode_wide());
     block.push(0);
     block.push(0); // double-null terminator
     block

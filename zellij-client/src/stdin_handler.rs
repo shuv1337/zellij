@@ -48,6 +48,13 @@ pub(crate) fn stdin_loop(
 
         if can_query_terminal {
             let query_string = build_startup_query_string();
+            // Arm the Kitty graphics support probe before writing it, so the
+            // parser resolves the reply (Kitty OK APC vs. the trailing DA
+            // barrier) the moment it arrives. The probe query is the tail of
+            // `query_string`.
+            if let Ok(mut parser) = stdin_ansi_parser.lock() {
+                parser.expect_kitty_graphics_probe();
+            }
             let _ = os_input
                 .get_stdout_writer()
                 .write(query_string.as_bytes())
@@ -285,5 +292,13 @@ fn build_startup_query_string() -> String {
     for i in 0..256 {
         query_string.push_str(&format!("\u{1b}]4;{};?\u{1b}\u{5c}", i));
     }
+    // Kitty graphics support probe (negative detection via the trailing
+    // Primary-DA barrier): a tiny `a=q` query for a 1x1 RGB image. A terminal
+    // that speaks Kitty answers `\e_Gi=4294967295;OK\e\\` *before* the DA;
+    // one that doesn't replies only to the DA (`\e[c`). The parser
+    // (`scan_kitty_probe`) resolves whichever arrives first. The high probe id
+    // avoids colliding with app-chosen ids.
+    query_string
+        .push_str("\u{1b}_Gi=4294967295,a=q,s=1,v=1,t=d,f=24;AAAA\u{1b}\u{5c}\u{1b}[c");
     query_string
 }

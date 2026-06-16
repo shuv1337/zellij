@@ -111,7 +111,7 @@ pub(crate) fn namespace_notification_id(metadata: &str, pane_id: u32) -> String 
 use vte::{Params, Perform};
 use zellij_utils::{consts::VERSION, shared::version_number};
 
-use crate::output::{CharacterChunk, HighlightSelection, OutputBuffer, SixelImageChunk};
+use crate::output::{CharacterChunk, HighlightSelection, KittyImageChunk, OutputBuffer, SixelImageChunk};
 use crate::panes::alacritty_functions::{parse_number, xparse_color};
 use crate::panes::hyperlink_tracker::HyperlinkTracker;
 use crate::panes::link_handler::LinkHandler;
@@ -611,6 +611,7 @@ pub struct Grid {
     title_stack: Vec<String>,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     sixel_grid: SixelGrid,
+    pub(crate) kitty_grid: crate::panes::kitty::KittyGrid,
     pub changed_colors: Option<[Option<AnsiCode>; 256]>,
     pub should_render: bool,
     pub lock_renders: bool,
@@ -967,6 +968,7 @@ impl Grid {
             character_cell_size,
             search_results: Default::default(),
             sixel_grid,
+            kitty_grid: crate::panes::kitty::KittyGrid::default(),
             pending_clipboard_update: None,
             pending_osc7_cwd: None,
             pending_desktop_notifications: Vec::new(),
@@ -991,6 +993,11 @@ impl Grid {
     }
     pub fn render_full_viewport(&mut self) {
         self.output_buffer.update_all_lines();
+    }
+    /// Source image ids deleted since the last call — surfaced to the render
+    /// path so the outer terminal can be told to delete them.
+    pub fn drain_kitty_deletions(&mut self) -> Vec<u32> {
+        self.kitty_grid.drain_deleted_image_ids()
     }
     pub fn update_line_for_rendering(&mut self, line_index: usize) {
         self.output_buffer.update_line(line_index);
@@ -1499,7 +1506,11 @@ impl Grid {
         &mut self,
         x_offset: usize,
         y_offset: usize,
-    ) -> (Vec<CharacterChunk>, Vec<SixelImageChunk>) {
+    ) -> (
+        Vec<CharacterChunk>,
+        Vec<SixelImageChunk>,
+        Vec<KittyImageChunk>,
+    ) {
         let changed_character_chunks = self.output_buffer.changed_chunks_in_viewport(
             self.viewport.make_contiguous(),
             self.width,
@@ -1520,9 +1531,27 @@ impl Grid {
         if let Some(image_ids_to_reap) = self.sixel_grid.drain_image_ids_to_reap() {
             self.sixel_grid.reap_images(image_ids_to_reap);
         }
+        // Kitty placements visible in the viewport. Re-emitted each render the
+        // pane produces (Kitty images persist in the outer terminal between
+        // renders); the per-client transmit-once state lives in `Output`.
+        let changed_kitty_image_chunks = match *self.character_cell_size.borrow() {
+            Some(cell_size) => self.kitty_grid.visible_kitty_chunks(
+                self.lines_above.len(),
+                self.height,
+                self.width,
+                x_offset,
+                y_offset,
+                cell_size,
+            ),
+            None => Vec::new(),
+        };
         self.output_buffer.clear();
 
-        (changed_character_chunks, changed_sixel_image_chunks)
+        (
+            changed_character_chunks,
+            changed_sixel_image_chunks,
+            changed_kitty_image_chunks,
+        )
     }
     pub fn serialize(&self, scrollback_lines_to_serialize: Option<usize>) -> Option<String> {
         match scrollback_lines_to_serialize {
@@ -1558,13 +1587,21 @@ impl Grid {
         content_x: usize,
         content_y: usize,
         style: &Style,
-    ) -> Result<Option<(Vec<CharacterChunk>, Option<String>, Vec<SixelImageChunk>)>> {
+    ) -> Result<
+        Option<(
+            Vec<CharacterChunk>,
+            Option<String>,
+            Vec<SixelImageChunk>,
+            Vec<KittyImageChunk>,
+        )>,
+    > {
         if self.lock_renders {
             return Ok(None);
         }
         let raw_vte_output = String::new();
 
-        let (mut character_chunks, sixel_image_chunks) = self.read_changes(content_x, content_y);
+        let (mut character_chunks, sixel_image_chunks, kitty_image_chunks) =
+            self.read_changes(content_x, content_y);
 
         let plugin_highlight_selections = self.compute_plugin_highlight_selections();
 
@@ -1658,6 +1695,7 @@ impl Grid {
             character_chunks,
             Some(raw_vte_output),
             sixel_image_chunks,
+            kitty_image_chunks,
         )));
     }
     /// Returns the cursor position and whether it is visible.
@@ -1899,6 +1937,11 @@ impl Grid {
                                 .remove_pixels_from_image(image_id, rect_in_image_to_cut_out);
                         }
                     }
+                    // Kitty placements can't be hole-punched like sixel, so text
+                    // drawn over an image reaps the whole placement (and queues
+                    // the outer-terminal delete).
+                    self.kitty_grid
+                        .reap_placements_intersecting(&rect_to_cut_out);
                 }
                 self.output_buffer.update_line(self.cursor.y);
             },
@@ -3898,13 +3941,20 @@ impl Perform for Grid {
                                     // outside of the alternate_screen_state struct
                                     self.sixel_grid.reap_images(image_ids_to_reap);
                                 }
+                                // The alternate screen's Kitty images must be
+                                // deleted from the outer terminal; collect them
+                                // before restoring, then queue on the restored
+                                // primary grid (which becomes the active one).
+                                let alternate_kitty_image_ids = self.kitty_grid.image_ids();
                                 alternate_screen_state.apply_contents_to(
                                     &mut self.lines_above,
                                     &mut self.viewport,
                                     &mut self.cursor,
                                     &mut self.sixel_grid,
+                                    &mut self.kitty_grid,
                                     &mut self.supports_kitty_keyboard_protocol,
                                 );
+                                self.kitty_grid.queue_deletions(alternate_kitty_image_ids);
                             }
                             self.alternate_screen_state = None;
                             self.clear_viewport_before_rendering = true;
@@ -4011,11 +4061,23 @@ impl Perform for Grid {
                                 &mut self.sixel_grid,
                                 SixelGrid::new(self.character_cell_size.clone(), sixel_image_store),
                             );
+                            // Stash the primary screen's Kitty grid and install a
+                            // fresh one; queue the primary's images for outer-
+                            // terminal deletion so they don't bleed through the
+                            // alternate screen (vim/less). They re-transmit on
+                            // exit when the primary grid is restored.
+                            let primary_kitty_image_ids = self.kitty_grid.image_ids();
+                            let alternate_kittygrid = std::mem::replace(
+                                &mut self.kitty_grid,
+                                crate::panes::kitty::KittyGrid::default(),
+                            );
+                            self.kitty_grid.queue_deletions(primary_kitty_image_ids);
                             self.alternate_screen_state = Some(AlternateScreenState::new(
                                 current_lines_above,
                                 current_viewport,
                                 current_cursor,
                                 alternate_sixelgrid,
+                                alternate_kittygrid,
                                 current_supports_kitty_keyboard_protocol,
                             ));
                             self.clear_viewport_before_rendering = true;
@@ -4515,6 +4577,61 @@ impl Perform for Grid {
             },
         }
     }
+
+    /// APC (Application Program Command). The vendored `vte` fork
+    /// (`vendor/vte-apc`) buffers the APC body and delivers it here once on ST,
+    /// with introducer/terminator stripped. Only Kitty graphics APCs
+    /// (`ESC _ G <keys>[;<payload>] ST`) are ours; every other APC user — and
+    /// the SOS/PM payloads that collapse onto the same vte state — must be left
+    /// untouched, hence the leading-`G` gate.
+    fn apc_dispatch(&mut self, bytes: &[u8]) {
+        // Not a Kitty graphics command (incl. SOS / PM): ignore.
+        let Some((&b'G', rest)) = bytes.split_first() else {
+            return;
+        };
+        match crate::panes::kitty::dispatch(rest) {
+            // Support probe: enrol on the existing forwarded-query pipeline so
+            // Screen synthesises the reply locally, ordered with surrounding PTY
+            // bytes via `forward_paused`/`pending_pty_input`. This MUST work even
+            // when the cell pixel size is unknown (the startup-probe window), so
+            // it is deliberately NOT gated on cursor pixel coordinates, and adds
+            // no Kitty-specific pause flag.
+            crate::panes::kitty::KittyOutcome::Query(query) => {
+                self.pending_forwarded_queries
+                    .push(crate::host_query::HostQuery::KittyGraphics(query));
+            },
+            // Transmit / display / place. Storage/reassembly happens regardless
+            // of cell size; only *anchoring* a placement needs the cell pixel
+            // size, so we gate just that step (mirroring the sixel `hook`).
+            crate::panes::kitty::KittyOutcome::Store(cmd) => {
+                if let Some(request) = self.kitty_grid.feed_chunk(cmd) {
+                    if let Some((x_px, y_px)) = self.current_cursor_pixel_coordinates() {
+                        if let Some((w, h)) = self.kitty_grid.image_dimensions(request.image_id) {
+                            // `PixelRect::new(x, y, height, width)` — height first.
+                            let rect =
+                                crate::panes::sixel::PixelRect::new(x_px, y_px, h as usize, w as usize);
+                            self.kitty_grid.add_placement(
+                                request.image_id,
+                                request.placement_id,
+                                rect,
+                            );
+                            // Advance the cursor past the image in whole cells,
+                            // exactly as `create_sixel_image` does.
+                            self.move_cursor_down_by_pixels(h as usize);
+                            self.mark_for_rerender();
+                        }
+                    }
+                }
+            },
+            // Explicit delete (`a=d`): drop from the grid; the removed source
+            // ids are drained at render time to delete from the outer terminal.
+            crate::panes::kitty::KittyOutcome::Delete(request) => {
+                self.kitty_grid.delete(request);
+                self.mark_for_rerender();
+            },
+            crate::panes::kitty::KittyOutcome::Ignore => {},
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -4523,6 +4640,7 @@ pub struct AlternateScreenState {
     viewport: VecDeque<Row>,
     cursor: Cursor,
     sixel_grid: SixelGrid,
+    kitty_grid: crate::panes::kitty::KittyGrid,
     supports_kitty_keyboard_protocol: bool,
 }
 impl AlternateScreenState {
@@ -4531,6 +4649,7 @@ impl AlternateScreenState {
         viewport: VecDeque<Row>,
         cursor: Cursor,
         sixel_grid: SixelGrid,
+        kitty_grid: crate::panes::kitty::KittyGrid,
         supports_kitty_keyboard_protocol: bool,
     ) -> Self {
         AlternateScreenState {
@@ -4538,6 +4657,7 @@ impl AlternateScreenState {
             viewport,
             cursor,
             sixel_grid,
+            kitty_grid,
             supports_kitty_keyboard_protocol,
         }
     }
@@ -4547,12 +4667,14 @@ impl AlternateScreenState {
         viewport: &mut VecDeque<Row>,
         cursor: &mut Cursor,
         sixel_grid: &mut SixelGrid,
+        kitty_grid: &mut crate::panes::kitty::KittyGrid,
         supports_kitty_keyboard_protocol: &mut bool,
     ) {
         std::mem::swap(&mut self.lines_above, lines_above);
         std::mem::swap(&mut self.viewport, viewport);
         std::mem::swap(&mut self.cursor, cursor);
         std::mem::swap(&mut self.sixel_grid, sixel_grid);
+        std::mem::swap(&mut self.kitty_grid, kitty_grid);
         std::mem::swap(
             &mut self.supports_kitty_keyboard_protocol,
             supports_kitty_keyboard_protocol,

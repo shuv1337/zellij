@@ -22,6 +22,9 @@ fn create_test_output() -> Output {
         character_cell_size,
         styled_underlines,
         osc8_hyperlinks,
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::panes::kitty::KittyRenderState::default(),
+        )),
     )
 }
 
@@ -95,6 +98,241 @@ fn test_is_dirty_with_character_chunks() {
     assert!(
         output.is_dirty(),
         "Output should be dirty after adding character chunks"
+    );
+}
+
+#[test]
+fn kitty_chunks_emitted_only_to_supporting_clients() {
+    use crate::output::KittyImageChunk;
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(2);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+
+    // Client 1 supports Kitty; client 2 does not.
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    support.insert(2, false);
+    output.set_outer_kitty_support(support);
+
+    let chunk = KittyImageChunk {
+        cell_x: 0,
+        cell_y: 0,
+        source_image_id: 5,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 10,
+        full_height: 10,
+        src_x: 0,
+        src_y: 0,
+        src_width: 10,
+        src_height: 10,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    output.add_kitty_image_chunks_to_multiple_clients(vec![chunk], client_ids.iter().copied(), None);
+
+    let serialized = output.serialize().unwrap();
+    let c1 = serialized.get(&1).cloned().unwrap_or_default();
+    let c2 = serialized.get(&2).cloned().unwrap_or_default();
+    assert!(c1.contains("a=t,q=2"), "supporting client transmits: {:?}", c1);
+    assert!(c1.contains("a=p,q=2"), "supporting client places: {:?}", c1);
+    assert!(
+        !c2.contains("_G"),
+        "non-supporting client gets no Kitty bytes: {:?}",
+        c2
+    );
+}
+
+fn make_kitty_chunk(cell_x: usize, cell_y: usize, w: usize, h: usize) -> crate::output::KittyImageChunk {
+    crate::output::KittyImageChunk {
+        cell_x,
+        cell_y,
+        source_image_id: 1,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: w,
+        full_height: h,
+        src_x: 0,
+        src_y: 0,
+        src_width: w,
+        src_height: h,
+        payload_b64: b"AAAA".to_vec(),
+    }
+}
+
+#[test]
+fn kitty_chunk_fully_under_floating_pane_is_dropped() {
+    // A covered tiled-pane image must not draw over a floating pane.
+    let pane_geom = create_pane_geom(0, 0, 10, 10); // covers cols 0-9, rows 0-9
+    let stack = FloatingPanesStack {
+        layers: vec![pane_geom],
+    };
+    let cell = SizeInPixels { width: 10, height: 20 };
+    // One cell (10x20px) at cell (2,2) — fully inside the covering pane.
+    let chunk = make_kitty_chunk(2, 2, 10, 20);
+    let visible = stack.visible_kitty_image_chunks(vec![chunk], Some(0), &cell);
+    assert!(visible.is_empty(), "fully-covered Kitty chunk must be dropped");
+}
+
+#[test]
+fn kitty_chunk_not_covered_passes_through() {
+    let pane_geom = create_pane_geom(0, 0, 5, 5);
+    let stack = FloatingPanesStack {
+        layers: vec![pane_geom],
+    };
+    let cell = SizeInPixels { width: 10, height: 20 };
+    // A cell at (20,20) — well clear of the covering pane.
+    let chunk = make_kitty_chunk(20, 20, 10, 20);
+    let visible = stack.visible_kitty_image_chunks(vec![chunk], Some(0), &cell);
+    assert_eq!(visible.len(), 1, "uncovered Kitty chunk survives");
+    assert_eq!(visible[0].source_image_id, 1);
+}
+
+#[test]
+fn kitty_chunks_and_deletions_mark_output_dirty() {
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    assert!(!output.is_dirty(), "no assets yet");
+
+    output.add_kitty_image_chunks_to_client(1, vec![make_kitty_chunk(0, 0, 10, 20)], None);
+    assert!(output.is_dirty(), "a Kitty-only placement must mark the frame dirty");
+    assert!(output.has_rendered_assets());
+}
+
+#[test]
+fn kitty_deletion_only_marks_output_dirty() {
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    output.add_kitty_deletions_to_multiple_clients(vec![5], std::iter::once(1));
+    assert!(output.is_dirty(), "a Kitty-only a=d delete must mark the frame dirty");
+}
+
+#[test]
+fn kitty_deletion_emits_delete_to_supporting_client() {
+    use crate::output::KittyImageChunk;
+    let mut output = create_test_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+
+    // First render: transmit + place image 5 (allocates an outer id).
+    let chunk = KittyImageChunk {
+        cell_x: 0,
+        cell_y: 0,
+        source_image_id: 5,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 4,
+        full_height: 4,
+        src_x: 0,
+        src_y: 0,
+        src_width: 4,
+        src_height: 4,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    output.add_kitty_image_chunks_to_client(1, vec![chunk], None);
+    let _ = output.serialize().unwrap();
+
+    // Re-add the same client entry (serialize drained it) and now delete image 5.
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+    output.add_kitty_deletions_to_multiple_clients(vec![5], std::iter::once(1));
+    let serialized = output.serialize().unwrap();
+    let c1 = serialized.get(&1).cloned().unwrap_or_default();
+    assert!(c1.contains("a=d,d=i,q=2"), "delete emitted to outer terminal: {:?}", c1);
+}
+
+#[test]
+fn kitty_placement_cropped_by_watcher_size_is_reconciled_stale() {
+    // Regression: `serialize_with_size` must reconcile against the chunks it
+    // actually emitted after `max_size` filtering. A placement that moves
+    // outside a watcher's smaller bounds is skipped during output; if the
+    // reconciliation frame were built from the unfiltered chunk list it would
+    // still be recorded as live, suppressing its delete and ghosting a
+    // cropped-out image on the outer terminal.
+    use crate::output::KittyImageChunk;
+    // The persistent render state (transmit-once + live placement tracking) is
+    // shared across renders via an Rc; `Output` itself is rebuilt each frame.
+    let kitty_render_state = Rc::new(RefCell::new(
+        crate::panes::kitty::KittyRenderState::default(),
+    ));
+    let new_frame_output = || {
+        Output::new(
+            Rc::new(RefCell::new(SixelImageStore::default())),
+            Rc::new(RefCell::new(Some(SizeInPixels { height: 20, width: 10 }))),
+            true,
+            true,
+            kitty_render_state.clone(),
+        )
+    };
+
+    let make_chunk = |cell_y: usize| KittyImageChunk {
+        cell_x: 0,
+        cell_y,
+        source_image_id: 7,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 4,
+        full_height: 4,
+        src_x: 0,
+        src_y: 0,
+        src_width: 4,
+        src_height: 4,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    // Watcher only sees rows 0..5.
+    let max_size = Some(Size { rows: 5, cols: 80 });
+
+    // Frame 1: placement at row 0 is inside the watcher bounds -> emitted + live.
+    let mut output = new_frame_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+    output.add_kitty_image_chunks_to_client(1, vec![make_chunk(0)], None);
+    let f1 = output.serialize_with_size(max_size, None).unwrap();
+    let c1 = f1.get(&1).cloned().unwrap_or_default();
+    assert!(c1.contains("a=p,q=2"), "frame 1 places the image: {:?}", c1);
+    assert!(!c1.contains("a=d"), "frame 1 has nothing stale to delete: {:?}", c1);
+
+    // Frame 2: the same placement moves to row 10, outside the watcher bounds.
+    // It is skipped during output; reconciliation must still delete it.
+    let mut output = new_frame_output();
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+    output.add_kitty_image_chunks_to_client(1, vec![make_chunk(10)], None);
+    let f2 = output.serialize_with_size(max_size, None).unwrap();
+    let c2 = f2.get(&1).cloned().unwrap_or_default();
+    assert!(
+        !c2.contains("a=p,q=2"),
+        "frame 2 does not re-place the cropped-out image: {:?}",
+        c2
+    );
+    assert!(
+        c2.contains("a=d,d=i,q=2") && c2.contains("p=1"),
+        "cropped-out placement is deleted, not ghosted: {:?}",
+        c2
     );
 }
 
