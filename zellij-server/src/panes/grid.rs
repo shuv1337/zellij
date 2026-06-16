@@ -611,6 +611,7 @@ pub struct Grid {
     title_stack: Vec<String>,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     sixel_grid: SixelGrid,
+    pub(crate) kitty_grid: crate::panes::kitty::KittyGrid,
     pub changed_colors: Option<[Option<AnsiCode>; 256]>,
     pub should_render: bool,
     pub lock_renders: bool,
@@ -967,6 +968,7 @@ impl Grid {
             character_cell_size,
             search_results: Default::default(),
             sixel_grid,
+            kitty_grid: crate::panes::kitty::KittyGrid::default(),
             pending_clipboard_update: None,
             pending_osc7_cwd: None,
             pending_desktop_notifications: Vec::new(),
@@ -4538,13 +4540,27 @@ impl Perform for Grid {
                 self.pending_forwarded_queries
                     .push(crate::host_query::HostQuery::KittyGraphics(query));
             },
-            // Transmit / display / place: anchoring needs the cell pixel size
-            // (Phase 1c). Gate exactly like the sixel `hook`; drop silently when
-            // unknown, matching sixel.
-            crate::panes::kitty::KittyOutcome::Store(_cmd) => {
-                if self.current_cursor_pixel_coordinates().is_some() {
-                    // TODO(Phase 1c): store the image and create a placement on
-                    // the KittyGrid, then `mark_for_rerender()`.
+            // Transmit / display / place. Storage/reassembly happens regardless
+            // of cell size; only *anchoring* a placement needs the cell pixel
+            // size, so we gate just that step (mirroring the sixel `hook`).
+            crate::panes::kitty::KittyOutcome::Store(cmd) => {
+                if let Some(request) = self.kitty_grid.feed_chunk(cmd) {
+                    if let Some((x_px, y_px)) = self.current_cursor_pixel_coordinates() {
+                        if let Some((w, h)) = self.kitty_grid.image_dimensions(request.image_id) {
+                            // `PixelRect::new(x, y, height, width)` — height first.
+                            let rect =
+                                crate::panes::sixel::PixelRect::new(x_px, y_px, h as usize, w as usize);
+                            self.kitty_grid.add_placement(
+                                request.image_id,
+                                request.placement_id,
+                                rect,
+                            );
+                            // Advance the cursor past the image in whole cells,
+                            // exactly as `create_sixel_image` does.
+                            self.move_cursor_down_by_pixels(h as usize);
+                            self.mark_for_rerender();
+                        }
+                    }
                 }
             },
             crate::panes::kitty::KittyOutcome::Ignore => {},

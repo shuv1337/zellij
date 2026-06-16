@@ -15,6 +15,7 @@
 //! Storage/anchoring (wiring the reassembler into the Grid) and rendering land in
 //! Phases 1c+. See `GOAL-kitty-graphics.md` and `KITTY_GRAPHICS_PLAN.md`.
 
+use super::sixel::PixelRect;
 use std::collections::HashMap;
 
 /// The classification of a parsed Kitty graphics command, as far as the Grid
@@ -340,12 +341,161 @@ impl PendingUpload {
     }
 }
 
+/// A stored, finalized Kitty image, keyed by its (app-chosen or allocated) id.
+/// The base64 payload is kept undecoded for verbatim re-transmission to the
+/// outer terminal (Phase 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredKittyImage {
+    pub control: KittyControl,
+    pub payload_b64: Vec<u8>,
+    pub dimensions: Option<(u32, u32)>,
+}
+
+/// An anchored placement of a stored image. `rect.y` is absolute pixels over the
+/// whole scrollback (signed, so it scrolls negative) — see [`PixelRect`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyPlacement {
+    pub image_id: u32,
+    pub placement_id: Option<u32>,
+    pub rect: PixelRect,
+}
+
+/// Returned by [`KittyGrid::feed_chunk`] when a finalized command wants a
+/// placement anchored at the cursor (transmit+display or place). The Grid owns
+/// the cursor↔pixel transform, so it computes the rect and calls back into
+/// [`KittyGrid::add_placement`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementRequest {
+    pub image_id: u32,
+    pub placement_id: Option<u32>,
+}
+
+/// Per-grid Kitty graphics state: the active multi-chunk upload, the stored
+/// images, and their placements.
+///
+/// Phase 1c keeps this grid-local (constructed by `Grid::new` with no signature
+/// change). Promotion to a shared `Rc<RefCell<KittyImageStore>>` threaded like
+/// the sixel store — needed only once the Phase 3 render path must read image
+/// payloads outside the grid — is deferred. See `GOAL-kitty-graphics.md`.
+#[derive(Debug, Clone, Default)]
+pub struct KittyGrid {
+    upload: Option<PendingUpload>,
+    images: HashMap<u32, StoredKittyImage>,
+    placements: Vec<KittyPlacement>,
+    /// Counter for ids we allocate locally (anonymous transmits / `I`-number).
+    next_local_id: u32,
+}
+
+impl KittyGrid {
+    /// Feed one `Store` command chunk. Drives `m=1` reassembly. Returns a
+    /// [`PlacementRequest`] when a finalized command should be anchored at the
+    /// cursor (transmit+display `a=T`, or place `a=p`); `None` while more chunks
+    /// are expected, on a transmit-only (`a=t`) finalize, or for a `place` of an
+    /// unknown id.
+    pub fn feed_chunk(&mut self, cmd: KittyCommand) -> Option<PlacementRequest> {
+        match cmd.control.action {
+            // Place references an already-stored image; no payload reassembly.
+            KittyAction::Place => {
+                let id = cmd.control.image_id?;
+                self.images.contains_key(&id).then_some(PlacementRequest {
+                    image_id: id,
+                    placement_id: cmd.control.placement_id,
+                })
+            },
+            KittyAction::Transmit | KittyAction::TransmitAndDisplay => {
+                let more = cmd.control.more;
+                match self.upload.as_mut() {
+                    // Continuation chunk: append to the active upload (its
+                    // control — action/format/id — comes from the first chunk).
+                    Some(upload) => upload.append(&cmd.payload),
+                    // First chunk (also the single-chunk case).
+                    None => {
+                        self.upload =
+                            Some(PendingUpload::begin(cmd.control.clone(), &cmd.payload));
+                    },
+                }
+                if more {
+                    return None; // await continuation chunks
+                }
+                let upload = self.upload.take()?;
+                let display = matches!(upload.control.action, KittyAction::TransmitAndDisplay);
+                let placement_id = upload.control.placement_id;
+                let finished = upload.finish();
+                let id = self.allocate_id(finished.control.image_id);
+                self.images.insert(
+                    id,
+                    StoredKittyImage {
+                        control: finished.control,
+                        payload_b64: finished.payload_b64,
+                        dimensions: finished.dimensions,
+                    },
+                );
+                display.then_some(PlacementRequest {
+                    image_id: id,
+                    placement_id,
+                })
+            },
+            KittyAction::Delete | KittyAction::Query | KittyAction::Unknown => None,
+        }
+    }
+
+    /// Resolve the id to store under: the app-chosen `i` if given, else a fresh
+    /// locally-allocated id that does not collide with a stored image.
+    fn allocate_id(&mut self, requested: Option<u32>) -> u32 {
+        if let Some(id) = requested {
+            return id;
+        }
+        loop {
+            self.next_local_id = self.next_local_id.wrapping_add(1);
+            if self.next_local_id != 0 && !self.images.contains_key(&self.next_local_id) {
+                return self.next_local_id;
+            }
+        }
+    }
+
+    /// Pixel dimensions of a stored image, if known.
+    pub fn image_dimensions(&self, image_id: u32) -> Option<(u32, u32)> {
+        self.images.get(&image_id)?.dimensions
+    }
+
+    /// Anchor a placement of a stored image at `rect`.
+    pub fn add_placement(&mut self, image_id: u32, placement_id: Option<u32>, rect: PixelRect) {
+        self.placements.push(KittyPlacement {
+            image_id,
+            placement_id,
+            rect,
+        });
+    }
+
+    // --- accessors (rendering/lifecycle phases + tests) ---
+
+    pub fn has_active_upload(&self) -> bool {
+        self.upload.is_some()
+    }
+    pub fn image_count(&self) -> usize {
+        self.images.len()
+    }
+    pub fn stored_image(&self, image_id: u32) -> Option<&StoredKittyImage> {
+        self.images.get(&image_id)
+    }
+    pub fn placements(&self) -> &[KittyPlacement] {
+        &self.placements
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn control_of(body: &[u8]) -> KittyControl {
         parse_control(&parse_keys(body))
+    }
+
+    fn store_cmd(body: &[u8]) -> KittyCommand {
+        match dispatch(body) {
+            KittyOutcome::Store(cmd) => cmd,
+            other => panic!("expected Store, got {:?}", other),
+        }
     }
 
     #[test]
@@ -491,5 +641,66 @@ mod tests {
         let finished = upload.finish();
         assert_eq!(finished.dimensions, Some((3, 4)));
         assert_eq!(finished.control.image_id, Some(1));
+    }
+
+    #[test]
+    fn feed_transmit_and_display_stores_and_requests_placement() {
+        let mut kg = KittyGrid::default();
+        let req = kg.feed_chunk(store_cmd(b"a=T,f=32,s=10,v=20,i=3;AAAA"));
+        assert_eq!(
+            req,
+            Some(PlacementRequest { image_id: 3, placement_id: None })
+        );
+        assert_eq!(kg.image_count(), 1);
+        assert_eq!(kg.image_dimensions(3), Some((10, 20)));
+        assert!(!kg.has_active_upload());
+    }
+
+    #[test]
+    fn feed_transmit_only_stores_without_placement() {
+        let mut kg = KittyGrid::default();
+        let req = kg.feed_chunk(store_cmd(b"a=t,f=32,s=4,v=4,i=9;AAAA"));
+        assert_eq!(req, None, "transmit-only must not request a placement");
+        assert!(kg.stored_image(9).is_some());
+    }
+
+    #[test]
+    fn feed_multichunk_reassembles_then_displays() {
+        let mut kg = KittyGrid::default();
+        // first chunk: control + m=1
+        assert_eq!(kg.feed_chunk(store_cmd(b"a=T,f=32,s=1,v=1,i=2,m=1;AA")), None);
+        assert!(kg.has_active_upload());
+        // final chunk: continuation, m absent → finalize + display
+        let req = kg.feed_chunk(store_cmd(b"m=0;AA"));
+        assert_eq!(
+            req,
+            Some(PlacementRequest { image_id: 2, placement_id: None })
+        );
+        assert_eq!(kg.stored_image(2).map(|i| i.payload_b64.clone()), Some(b"AAAA".to_vec()));
+        assert!(!kg.has_active_upload());
+    }
+
+    #[test]
+    fn place_of_known_image_requests_placement() {
+        let mut kg = KittyGrid::default();
+        kg.feed_chunk(store_cmd(b"a=t,f=32,s=1,v=1,i=5;AAAA"));
+        let req = kg.feed_chunk(store_cmd(b"a=p,i=5,p=7"));
+        assert_eq!(
+            req,
+            Some(PlacementRequest { image_id: 5, placement_id: Some(7) })
+        );
+    }
+
+    #[test]
+    fn place_of_unknown_image_is_noop() {
+        let mut kg = KittyGrid::default();
+        assert_eq!(kg.feed_chunk(store_cmd(b"a=p,i=404")), None);
+    }
+
+    #[test]
+    fn anonymous_transmit_allocates_local_id() {
+        let mut kg = KittyGrid::default();
+        kg.feed_chunk(store_cmd(b"a=t,f=32,s=1,v=1;AAAA")); // no i=
+        assert_eq!(kg.image_count(), 1);
     }
 }

@@ -88,24 +88,25 @@ downstream consumes them yet.
 > inflater (`flate2`/`miniz_oxide`), a new dependency. Deferred until it's worth
 > adding — most real payloads carry `s,v` or are uncompressed PNG.
 
-### 1c. Storage & anchoring
-- [ ] `KittyImageStore` (`HashMap<u32, KittyImage{format,payload,px_w,px_h}>`),
-  shared `Rc<RefCell<…>>`, built at `screen.rs:1569`, cloned down
-  tab→pane→grid. **Also holds the durable per-client outer-terminal state from
-  the start** (`transmitted`, `placements`, `outer_ids` — see Phase 3).
-- [ ] `KittyGrid` (`placements: HashMap<PlacementKey, PixelRect>`,
-  `image_ids_to_reap`, shared cell-size handle). **Reuse `PixelRect`
-  (`sixel.rs:13-19`) unchanged** — call `PixelRect::new(x, y, height, width)`
-  (height before width).
-- [ ] On `a=T`/`a=p`: anchor from `current_cursor_pixel_coordinates()`
-  (`grid.rs:2921`), build `PixelRect`, insert, advance cursor by whole cells
-  (`move_cursor_down_by_pixels` `grid.rs:2908`) — mirror `create_sixel_image`
-  (`grid.rs:2933`). Cell-size guard like sixel `hook` (`grid.rs:3485`).
-- [ ] Reuse `offset_grid_top` (`sixel.rs:213-218` via `bounded_push`
-  `grid.rs:319`), `character_cell_size_possibly_changed` (`sixel.rs:235`),
-  alt-screen swap (`grid.rs:4009`).
-- [ ] **Tests:** store/anchor; scroll reaping; cursor advance (clone sixel cases
-  in `panes/unit/grid_tests.rs`).
+### 1c. Storage & anchoring — DONE (store grid-local; sharing deferred)
+- [x] `KittyGrid` (in `kitty.rs`): active upload + `images: HashMap<u32,
+  StoredKittyImage>` + `placements: Vec<KittyPlacement>` + local id allocator.
+  `feed_chunk()` drives reassembly and returns a `PlacementRequest` for
+  display/place. **Reuses `PixelRect` unchanged**; `PixelRect::new(x,y,h,w)`.
+- [x] Grid holds `kitty_grid: KittyGrid` — constructed in `Grid::new` with **no
+  signature change** (avoids churning 185 `Grid::new` call sites). The store is
+  **grid-local**; promotion to a shared `Rc<RefCell<KittyImageStore>>` threaded
+  like sixel (+ per-client `transmitted`/`outer_ids`) is **deferred to Phase 3**,
+  where the render path first needs cross-grid access.
+- [x] On finalized `a=T`/`a=p`: anchor from `current_cursor_pixel_coordinates()`,
+  build `PixelRect`, `add_placement`, advance cursor via
+  `move_cursor_down_by_pixels` — storage runs regardless of cell size, only
+  anchoring is cell-size-gated.
+- [ ] `offset_grid_top` scroll-reaping / `character_cell_size_possibly_changed` /
+  alt-screen swap — **deferred to Phase 4** (lifecycle), needs the reap plumbing.
+- [x] **Tests (10 green, +1c):** `feed_chunk` store/display/transmit-only/
+  multichunk/place/anonymous-id (kitty.rs); Grid-level `a=T` stores+anchors at
+  the right `PixelRect` + advances cursor 2 rows, `a=t` stores without placement.
 
 ### 1d/Phase 2. Per-client outer-terminal capability detection
 - [ ] `stdin_ansi_parser.rs`: third `strip_replies` branch for APC (`:424-480`)

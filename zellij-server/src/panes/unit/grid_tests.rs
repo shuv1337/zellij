@@ -6153,7 +6153,7 @@ fn non_g_apc_is_ignored_by_grid() {
 #[test]
 fn kitty_transmit_command_does_not_enrol_a_query() {
     // A transmit/display command (`a=T`) is a Store, not a Query: it must not
-    // land on the forwarded-query pipeline (Phase 1c handles storage).
+    // land on the forwarded-query pipeline.
     let mut parser = vte::Parser::new();
     let mut grid = new_grid_for_forwarding_test();
     for byte in b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\" {
@@ -6163,4 +6163,45 @@ fn kitty_transmit_command_does_not_enrol_a_query() {
         grid.pending_forwarded_queries.is_empty(),
         "a=T transmit must not enrol a forwarded query"
     );
+}
+
+#[test]
+fn kitty_transmit_and_display_stores_anchors_and_advances_cursor() {
+    // `new_grid_for_forwarding_test` has a known cell size of 8x16 px, so
+    // anchoring fires. A 16x32 px image at cursor (0,0) anchors at pixel rect
+    // {x:0, y:0, width:16, height:32} and advances the cursor by 32/16 = 2 rows.
+    use crate::panes::sixel::PixelRect;
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=T,f=32,s=16,v=32,i=1;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert_eq!(grid.kitty_grid.image_count(), 1, "image must be stored");
+    assert_eq!(grid.kitty_grid.image_dimensions(1), Some((16, 32)));
+    let placements = grid.kitty_grid.placements();
+    assert_eq!(placements.len(), 1, "a=T must anchor exactly one placement");
+    assert_eq!(placements[0].image_id, 1);
+    assert_eq!(placements[0].rect, PixelRect::new(0, 0, 32, 16));
+    assert_eq!(
+        grid.cursor_coordinates().map(|(_, y, _)| y),
+        Some(2),
+        "cursor must advance by ceil(32/16) = 2 rows"
+    );
+}
+
+#[test]
+fn kitty_transmit_only_stores_without_placement() {
+    // `a=t` (transmit-only) stores the image but anchors no placement and does
+    // not move the cursor.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test();
+    for byte in b"\x1b_Ga=t,f=32,s=8,v=16,i=4;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    assert!(grid.kitty_grid.stored_image(4).is_some(), "image must be stored");
+    assert!(
+        grid.kitty_grid.placements().is_empty(),
+        "transmit-only must not anchor a placement"
+    );
+    assert_eq!(grid.cursor_coordinates().map(|(_, y, _)| y), Some(0));
 }
