@@ -138,6 +138,10 @@ pub struct KittyControl {
     pub src_width: Option<u32>,
     /// `v=` source height in px (raw formats).
     pub src_height: Option<u32>,
+    /// `c=` target width in cells (scale the image into this many columns).
+    pub target_cols: Option<u32>,
+    /// `r=` target height in cells (scale the image into this many rows).
+    pub target_rows: Option<u32>,
     /// `o=z` — payload is zlib-compressed.
     pub compressed: bool,
     /// `q=` quiet level.
@@ -298,6 +302,8 @@ pub fn parse_control(keys: &HashMap<char, String>) -> KittyControl {
         more: keys.get(&'m').map(String::as_str) == Some("1"),
         src_width: num('s'),
         src_height: num('v'),
+        target_cols: num('c'),
+        target_rows: num('r'),
         compressed: keys.get(&'o').map(String::as_str) == Some("z"),
         quiet: keys.get(&'q').and_then(|v| v.parse().ok()).unwrap_or(0),
     }
@@ -418,7 +424,14 @@ pub struct StoredKittyImage {
 pub struct KittyPlacement {
     pub image_id: u32,
     pub placement_id: Option<u32>,
+    /// Anchored footprint in absolute scrollback pixels. This is the *display*
+    /// footprint: for a `c=`/`r=`-scaled image it is `cols*cell_w x rows*cell_h`,
+    /// otherwise the image's native pixel size.
     pub rect: PixelRect,
+    /// Whether the app requested cell-target scaling (`c=`/`r=`). Drives whether
+    /// the outer placement carries `c`/`r` and whether the crop must be mapped
+    /// from display pixels back to source pixels at emit.
+    pub scaled: bool,
 }
 
 /// Returned by [`KittyGrid::feed_chunk`] when a finalized command wants a
@@ -429,6 +442,14 @@ pub struct KittyPlacement {
 pub struct PlacementRequest {
     pub image_id: u32,
     pub placement_id: Option<u32>,
+    /// `c=`/`r=` target cell footprint captured from the command that *finalizes*
+    /// the upload. For a multi-chunk `a=T` the `c=`/`r=` keys appear on the first
+    /// chunk (whose control is retained by `PendingUpload`), not on the final
+    /// `m=0` chunk; reading them from the finalized control — rather than from
+    /// the chunk that happens to trigger the request — keeps scaled multi-chunk
+    /// images from anchoring at native pixel size.
+    pub target_cols: Option<u32>,
+    pub target_rows: Option<u32>,
 }
 
 /// Per-grid Kitty graphics state: the active multi-chunk upload, the stored
@@ -464,6 +485,8 @@ impl KittyGrid {
                 self.images.contains_key(&id).then_some(PlacementRequest {
                     image_id: id,
                     placement_id: cmd.control.placement_id,
+                    target_cols: cmd.control.target_cols,
+                    target_rows: cmd.control.target_rows,
                 })
             },
             KittyAction::Transmit | KittyAction::TransmitAndDisplay => {
@@ -484,6 +507,8 @@ impl KittyGrid {
                 let upload = self.upload.take()?;
                 let display = matches!(upload.control.action, KittyAction::TransmitAndDisplay);
                 let placement_id = upload.control.placement_id;
+                let target_cols = upload.control.target_cols;
+                let target_rows = upload.control.target_rows;
                 let finished = upload.finish();
                 // v1 only handles direct (`t=d`) media. Storing a file /
                 // shared-memory transmission and re-emitting its payload inline
@@ -513,6 +538,8 @@ impl KittyGrid {
                 display.then_some(PlacementRequest {
                     image_id: id,
                     placement_id,
+                    target_cols,
+                    target_rows,
                 })
             },
             KittyAction::Delete | KittyAction::Query | KittyAction::Unknown => None,
@@ -613,12 +640,20 @@ impl KittyGrid {
         self.images.get(&image_id)?.dimensions
     }
 
-    /// Anchor a placement of a stored image at `rect`.
-    pub fn add_placement(&mut self, image_id: u32, placement_id: Option<u32>, rect: PixelRect) {
+    /// Anchor a placement of a stored image at `rect` (its display footprint).
+    /// `scaled` records whether the app requested `c=`/`r=` cell-target scaling.
+    pub fn add_placement(
+        &mut self,
+        image_id: u32,
+        placement_id: Option<u32>,
+        rect: PixelRect,
+        scaled: bool,
+    ) {
         self.placements.push(KittyPlacement {
             image_id,
             placement_id,
             rect,
+            scaled,
         });
     }
 
@@ -688,6 +723,8 @@ impl KittyGrid {
             let cell_x = viewport_x_offset + rect.x / cell_w;
             let cell_y = viewport_y_offset + ((visible_top - viewport_top_px) as usize) / cell_h;
 
+            // Native source dims (for the one-time transmit and source-crop
+            // conversion); fall back to the display footprint if unknown.
             let (full_w, full_h) = image
                 .dimensions
                 .unwrap_or((rect.width as u32, rect.height as u32));
@@ -705,6 +742,12 @@ impl KittyGrid {
                 compressed: image.control.compressed,
                 full_width: full_w as usize,
                 full_height: full_h as usize,
+                // Display footprint of the whole placement; the crop below is in
+                // this same display space (so the floating-pane clip geometry,
+                // shared with sixel, applies unchanged).
+                disp_width: rect.width,
+                disp_height: rect.height,
+                scaled: placement.scaled,
                 src_x: 0,
                 src_y,
                 src_width,
@@ -819,11 +862,22 @@ impl KittyRenderState {
             out.extend_from_slice(b"\x1b\\");
             self.transmitted.insert((client_id, chunk.source_image_id), true);
         }
-        // Place (with source crop) — re-emitted each frame; cheap.
-        let place = format!(
-            "\x1b_Ga=p,q=2,i={},p={},x={},y={},w={},h={},C=1\x1b\\",
+        // Place (with source crop) — re-emitted each frame; cheap. When the app
+        // requested cell-target scaling, carry `c`/`r` so the outer terminal
+        // scales the cropped region into the same cell footprint the inner app
+        // reserved (without `c`/`r` the outer terminal would draw at native
+        // pixel size, leaving a gap below the image).
+        let mut place = format!(
+            "\x1b_Ga=p,q=2,i={},p={},x={},y={},w={},h={}",
             outer_id, chunk.placement_id, chunk.src_x, chunk.src_y, chunk.src_width, chunk.src_height
         );
+        if let Some(cols) = chunk.target_cols {
+            place.push_str(&format!(",c={}", cols));
+        }
+        if let Some(rows) = chunk.target_rows {
+            place.push_str(&format!(",r={}", rows));
+        }
+        place.push_str(",C=1\x1b\\");
         out.extend_from_slice(place.as_bytes());
         out
     }
@@ -899,6 +953,10 @@ pub struct KittyChunkSpec {
     pub src_y: usize,
     pub src_width: usize,
     pub src_height: usize,
+    /// `c=`/`r=` target cell footprint for a scaled placement. `None` emits the
+    /// cropped region at native pixel size (legacy, unscaled behavior).
+    pub target_cols: Option<u32>,
+    pub target_rows: Option<u32>,
     pub payload_b64: Vec<u8>,
 }
 
@@ -1003,6 +1061,17 @@ mod tests {
         assert_eq!(c.medium, KittyMedium::Direct); // default t=d
         assert!(!c.more);
         assert!(c.medium_supported());
+        // No cell-target scaling unless `c=`/`r=` are present.
+        assert_eq!(c.target_cols, None);
+        assert_eq!(c.target_rows, None);
+    }
+
+    #[test]
+    fn parses_cell_target_columns_and_rows() {
+        // Apps like `pi` send `c=`/`r=` to scale the image into a cell box.
+        let c = control_of(b"a=T,f=100,i=1,c=54,r=30");
+        assert_eq!(c.target_cols, Some(54));
+        assert_eq!(c.target_rows, Some(30));
     }
 
     #[test]
@@ -1133,7 +1202,7 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"a=T,f=32,s=10,v=20,i=3;AAAA"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 3, placement_id: None })
+            Some(PlacementRequest { image_id: 3, placement_id: None, target_cols: None, target_rows: None })
         );
         assert_eq!(kg.image_count(), 1);
         assert_eq!(kg.image_dimensions(3), Some((10, 20)));
@@ -1158,10 +1227,29 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"m=0;AA"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 2, placement_id: None })
+            Some(PlacementRequest { image_id: 2, placement_id: None, target_cols: None, target_rows: None })
         );
         assert_eq!(kg.stored_image(2).map(|i| i.payload_b64.clone()), Some(b"AAAA".to_vec()));
         assert!(!kg.has_active_upload());
+    }
+
+    #[test]
+    fn feed_multichunk_scaled_carries_cell_target_from_first_chunk() {
+        // The `c=`/`r=` keys live on the first chunk (retained by
+        // `PendingUpload`); the final `m=0` chunk carries neither. The finalized
+        // `PlacementRequest` must carry the first chunk's target footprint.
+        let mut kg = KittyGrid::default();
+        assert_eq!(kg.feed_chunk(store_cmd(b"a=T,f=32,s=100,v=100,c=4,r=3,i=7,m=1;AA")), None);
+        let req = kg.feed_chunk(store_cmd(b"m=0;AA"));
+        assert_eq!(
+            req,
+            Some(PlacementRequest {
+                image_id: 7,
+                placement_id: None,
+                target_cols: Some(4),
+                target_rows: Some(3),
+            })
+        );
     }
 
     #[test]
@@ -1171,7 +1259,7 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"a=p,i=5,p=7"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 5, placement_id: Some(7) })
+            Some(PlacementRequest { image_id: 5, placement_id: Some(7), target_cols: None, target_rows: None })
         );
     }
 
@@ -1214,7 +1302,7 @@ mod tests {
     fn reap_placements_intersecting_removes_overlapping_image() {
         let mut kg = KittyGrid::default();
         kg.feed_chunk(store_cmd(b"a=T,f=32,s=20,v=20,i=4;AAAA"));
-        kg.add_placement(4, None, PixelRect::new(0, 0, 20, 20));
+        kg.add_placement(4, None, PixelRect::new(0, 0, 20, 20), false);
         // A cell rect inside the image reaps the whole placement + image.
         kg.reap_placements_intersecting(&PixelRect::new(0, 0, 16, 8));
         assert!(kg.placements().is_empty());
@@ -1222,7 +1310,7 @@ mod tests {
         assert_eq!(kg.drain_deleted_image_ids(), vec![4]);
         // A non-overlapping rect reaps nothing.
         kg.feed_chunk(store_cmd(b"a=T,f=32,s=8,v=8,i=5;AAAA"));
-        kg.add_placement(5, None, PixelRect::new(0, 0, 8, 8));
+        kg.add_placement(5, None, PixelRect::new(0, 0, 8, 8), false);
         kg.reap_placements_intersecting(&PixelRect::new(800, 800, 16, 8));
         assert_eq!(kg.placements().len(), 1);
     }
@@ -1241,6 +1329,8 @@ mod tests {
             src_y: 0,
             src_width: 20,
             src_height: 10,
+            target_cols: None,
+            target_rows: None,
             payload_b64: b"AAAA".to_vec(),
         }
     }
@@ -1261,6 +1351,30 @@ mod tests {
         assert!(!second.contains("a=t"), "must not re-transmit: {}", second);
         assert!(second.contains("a=p,q=2"), "still re-places: {}", second);
         assert!(!second.contains("AAAA"), "no payload on re-place");
+    }
+
+    #[test]
+    fn render_emits_cell_target_when_scaled() {
+        // A scaled placement must carry `c`/`r` so the outer terminal draws the
+        // image in the same cell footprint the inner app reserved (no gap).
+        let mut rs = KittyRenderState::default();
+        let mut s = spec();
+        s.target_cols = Some(54);
+        s.target_rows = Some(30);
+        let bytes = String::from_utf8(rs.render_chunk_bytes(1, &s)).unwrap();
+        assert!(bytes.contains("a=p,q=2"), "places: {}", bytes);
+        assert!(bytes.contains(",c=54"), "carries target cols: {}", bytes);
+        assert!(bytes.contains(",r=30"), "carries target rows: {}", bytes);
+    }
+
+    #[test]
+    fn render_omits_cell_target_when_unscaled() {
+        // Native-size placements must NOT carry `c`/`r` (legacy behavior).
+        let mut rs = KittyRenderState::default();
+        let bytes = String::from_utf8(rs.render_chunk_bytes(1, &spec())).unwrap();
+        assert!(bytes.contains("a=p,q=2"), "places: {}", bytes);
+        assert!(!bytes.contains(",c="), "no target cols: {}", bytes);
+        assert!(!bytes.contains(",r="), "no target rows: {}", bytes);
     }
 
     #[test]
@@ -1350,7 +1464,7 @@ mod tests {
         let mut kg = KittyGrid::default();
         kg.feed_chunk(store_cmd(b"a=T,f=32,s=1,v=1,i=3;AAAA"));
         // The Grid normally anchors the placement after feed_chunk; do it here.
-        kg.add_placement(3, None, PixelRect::new(0, 0, 1, 1));
+        kg.add_placement(3, None, PixelRect::new(0, 0, 1, 1), false);
         assert_eq!(kg.image_count(), 1);
         assert_eq!(kg.placements().len(), 1);
 
@@ -1381,9 +1495,9 @@ mod tests {
         // stays stuck in the outer terminal after `clear`.
         let mut kg = KittyGrid::default();
         kg.feed_chunk(store_cmd(b"a=T,f=32,s=4,v=4,i=1;AAAA"));
-        kg.add_placement(1, None, PixelRect::new(0, 0, 4, 4));
+        kg.add_placement(1, None, PixelRect::new(0, 0, 4, 4), false);
         kg.feed_chunk(store_cmd(b"a=T,f=32,s=4,v=4,i=2;AAAA"));
-        kg.add_placement(2, None, PixelRect::new(0, 0, 4, 4));
+        kg.add_placement(2, None, PixelRect::new(0, 0, 4, 4), false);
         assert_eq!(kg.image_count(), 2);
 
         kg.clear();
