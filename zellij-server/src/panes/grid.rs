@@ -4684,10 +4684,12 @@ impl Perform for Grid {
                                 rect,
                                 scaled,
                             );
-                            // Advance the cursor past the image's display height
-                            // in whole cells, exactly as `create_sixel_image`
-                            // does (so reserved rows match what we draw).
-                            self.move_cursor_down_by_pixels(disp_h);
+                            // Apply Kitty's cursor movement policy. TUI apps often
+                            // emit `C=1` and reserve/move through explicit newlines;
+                            // moving here too would double-count the image height.
+                            if request.move_cursor {
+                                self.move_cursor_down_by_pixels(disp_h);
+                            }
                             self.mark_for_rerender();
                         }
                     }

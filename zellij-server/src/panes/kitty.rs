@@ -142,6 +142,9 @@ pub struct KittyControl {
     pub target_cols: Option<u32>,
     /// `r=` target height in cells (scale the image into this many rows).
     pub target_rows: Option<u32>,
+    /// Cursor movement policy: `C=1` means the terminal must not move the cursor
+    /// after placing the image; absent/`C=0` means apply Kitty's default movement.
+    pub move_cursor: bool,
     /// `o=z` — payload is zlib-compressed.
     pub compressed: bool,
     /// `q=` quiet level.
@@ -304,6 +307,7 @@ pub fn parse_control(keys: &HashMap<char, String>) -> KittyControl {
         src_height: num('v'),
         target_cols: num('c'),
         target_rows: num('r'),
+        move_cursor: num('C') != Some(1),
         compressed: keys.get(&'o').map(String::as_str) == Some("z"),
         quiet: keys.get(&'q').and_then(|v| v.parse().ok()).unwrap_or(0),
     }
@@ -450,6 +454,9 @@ pub struct PlacementRequest {
     /// images from anchoring at native pixel size.
     pub target_cols: Option<u32>,
     pub target_rows: Option<u32>,
+    /// Whether this placement should apply Kitty's default cursor movement.
+    /// `false` corresponds to `C=1`, where the app reserves/moves explicitly.
+    pub move_cursor: bool,
 }
 
 /// Per-grid Kitty graphics state: the active multi-chunk upload, the stored
@@ -487,6 +494,7 @@ impl KittyGrid {
                     placement_id: cmd.control.placement_id,
                     target_cols: cmd.control.target_cols,
                     target_rows: cmd.control.target_rows,
+                    move_cursor: cmd.control.move_cursor,
                 })
             },
             KittyAction::Transmit | KittyAction::TransmitAndDisplay => {
@@ -509,6 +517,7 @@ impl KittyGrid {
                 let placement_id = upload.control.placement_id;
                 let target_cols = upload.control.target_cols;
                 let target_rows = upload.control.target_rows;
+                let move_cursor = upload.control.move_cursor;
                 let finished = upload.finish();
                 // v1 only handles direct (`t=d`) media. Storing a file /
                 // shared-memory transmission and re-emitting its payload inline
@@ -540,6 +549,7 @@ impl KittyGrid {
                     placement_id,
                     target_cols,
                     target_rows,
+                    move_cursor,
                 })
             },
             KittyAction::Delete | KittyAction::Query | KittyAction::Unknown => None,
@@ -1064,6 +1074,16 @@ mod tests {
         // No cell-target scaling unless `c=`/`r=` are present.
         assert_eq!(c.target_cols, None);
         assert_eq!(c.target_rows, None);
+        // Kitty default is to move the cursor after placement unless `C=1`.
+        assert!(c.move_cursor);
+    }
+
+    #[test]
+    fn parses_cursor_movement_policy() {
+        assert!(!control_of(b"a=T,C=1").move_cursor, "C=1 disables cursor movement");
+        assert!(!control_of(b"a=T,C=01").move_cursor, "C is parsed numerically");
+        assert!(control_of(b"a=T,C=0").move_cursor, "C=0 keeps default cursor movement");
+        assert!(control_of(b"a=T,C=99").move_cursor, "unknown C values keep default behavior");
     }
 
     #[test]
@@ -1202,7 +1222,13 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"a=T,f=32,s=10,v=20,i=3;AAAA"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 3, placement_id: None, target_cols: None, target_rows: None })
+            Some(PlacementRequest {
+                image_id: 3,
+                placement_id: None,
+                target_cols: None,
+                target_rows: None,
+                move_cursor: true,
+            })
         );
         assert_eq!(kg.image_count(), 1);
         assert_eq!(kg.image_dimensions(3), Some((10, 20)));
@@ -1227,7 +1253,13 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"m=0;AA"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 2, placement_id: None, target_cols: None, target_rows: None })
+            Some(PlacementRequest {
+                image_id: 2,
+                placement_id: None,
+                target_cols: None,
+                target_rows: None,
+                move_cursor: true,
+            })
         );
         assert_eq!(kg.stored_image(2).map(|i| i.payload_b64.clone()), Some(b"AAAA".to_vec()));
         assert!(!kg.has_active_upload());
@@ -1248,6 +1280,7 @@ mod tests {
                 placement_id: None,
                 target_cols: Some(4),
                 target_rows: Some(3),
+                move_cursor: true,
             })
         );
     }
@@ -1259,7 +1292,13 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"a=p,i=5,p=7"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 5, placement_id: Some(7), target_cols: None, target_rows: None })
+            Some(PlacementRequest {
+                image_id: 5,
+                placement_id: Some(7),
+                target_cols: None,
+                target_rows: None,
+                move_cursor: true,
+            })
         );
     }
 

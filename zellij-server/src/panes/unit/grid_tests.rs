@@ -6355,6 +6355,31 @@ fn kitty_cell_target_scales_footprint_and_reserves_matching_rows() {
 }
 
 #[test]
+fn kitty_cursor_policy_c1_does_not_advance_cursor() {
+    // TUI renderers such as pi reserve image rows themselves, then emit Kitty
+    // placements with `C=1` so the terminal does NOT apply its default cursor
+    // movement. zellij must mirror that policy; otherwise it advances once for
+    // the image and then again for the app's explicit row reservation, leaving a
+    // large blank gap below the rendered image.
+    use crate::panes::sixel::PixelRect;
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test(); // cell size 8x16
+
+    for byte in b"\x1b_Ga=T,f=32,s=100,v=100,c=4,r=3,C=1,i=8;AAAA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+
+    let placements = grid.kitty_grid.placements();
+    assert_eq!(placements.len(), 1, "C=1 still anchors a placement");
+    assert_eq!(placements[0].rect, PixelRect::new(0, 0, 48, 32));
+    assert_eq!(
+        grid.cursor_coordinates().map(|(_, y, _)| y),
+        Some(0),
+        "C=1 requests no automatic cursor movement"
+    );
+}
+
+#[test]
 fn kitty_scaled_multichunk_carries_cell_target_from_first_chunk() {
     // Multi-chunk `a=T`: the `c=`/`r=` keys appear on the first chunk (whose
     // control is retained by `PendingUpload`), NOT on the final `m=0` chunk.
