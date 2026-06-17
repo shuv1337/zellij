@@ -442,6 +442,14 @@ pub struct KittyPlacement {
 pub struct PlacementRequest {
     pub image_id: u32,
     pub placement_id: Option<u32>,
+    /// `c=`/`r=` target cell footprint captured from the command that *finalizes*
+    /// the upload. For a multi-chunk `a=T` the `c=`/`r=` keys appear on the first
+    /// chunk (whose control is retained by `PendingUpload`), not on the final
+    /// `m=0` chunk; reading them from the finalized control — rather than from
+    /// the chunk that happens to trigger the request — keeps scaled multi-chunk
+    /// images from anchoring at native pixel size.
+    pub target_cols: Option<u32>,
+    pub target_rows: Option<u32>,
 }
 
 /// Per-grid Kitty graphics state: the active multi-chunk upload, the stored
@@ -477,6 +485,8 @@ impl KittyGrid {
                 self.images.contains_key(&id).then_some(PlacementRequest {
                     image_id: id,
                     placement_id: cmd.control.placement_id,
+                    target_cols: cmd.control.target_cols,
+                    target_rows: cmd.control.target_rows,
                 })
             },
             KittyAction::Transmit | KittyAction::TransmitAndDisplay => {
@@ -497,6 +507,8 @@ impl KittyGrid {
                 let upload = self.upload.take()?;
                 let display = matches!(upload.control.action, KittyAction::TransmitAndDisplay);
                 let placement_id = upload.control.placement_id;
+                let target_cols = upload.control.target_cols;
+                let target_rows = upload.control.target_rows;
                 let finished = upload.finish();
                 // v1 only handles direct (`t=d`) media. Storing a file /
                 // shared-memory transmission and re-emitting its payload inline
@@ -526,6 +538,8 @@ impl KittyGrid {
                 display.then_some(PlacementRequest {
                     image_id: id,
                     placement_id,
+                    target_cols,
+                    target_rows,
                 })
             },
             KittyAction::Delete | KittyAction::Query | KittyAction::Unknown => None,
@@ -1188,7 +1202,7 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"a=T,f=32,s=10,v=20,i=3;AAAA"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 3, placement_id: None })
+            Some(PlacementRequest { image_id: 3, placement_id: None, target_cols: None, target_rows: None })
         );
         assert_eq!(kg.image_count(), 1);
         assert_eq!(kg.image_dimensions(3), Some((10, 20)));
@@ -1213,10 +1227,29 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"m=0;AA"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 2, placement_id: None })
+            Some(PlacementRequest { image_id: 2, placement_id: None, target_cols: None, target_rows: None })
         );
         assert_eq!(kg.stored_image(2).map(|i| i.payload_b64.clone()), Some(b"AAAA".to_vec()));
         assert!(!kg.has_active_upload());
+    }
+
+    #[test]
+    fn feed_multichunk_scaled_carries_cell_target_from_first_chunk() {
+        // The `c=`/`r=` keys live on the first chunk (retained by
+        // `PendingUpload`); the final `m=0` chunk carries neither. The finalized
+        // `PlacementRequest` must carry the first chunk's target footprint.
+        let mut kg = KittyGrid::default();
+        assert_eq!(kg.feed_chunk(store_cmd(b"a=T,f=32,s=100,v=100,c=4,r=3,i=7,m=1;AA")), None);
+        let req = kg.feed_chunk(store_cmd(b"m=0;AA"));
+        assert_eq!(
+            req,
+            Some(PlacementRequest {
+                image_id: 7,
+                placement_id: None,
+                target_cols: Some(4),
+                target_rows: Some(3),
+            })
+        );
     }
 
     #[test]
@@ -1226,7 +1259,7 @@ mod tests {
         let req = kg.feed_chunk(store_cmd(b"a=p,i=5,p=7"));
         assert_eq!(
             req,
-            Some(PlacementRequest { image_id: 5, placement_id: Some(7) })
+            Some(PlacementRequest { image_id: 5, placement_id: Some(7), target_cols: None, target_rows: None })
         );
     }
 

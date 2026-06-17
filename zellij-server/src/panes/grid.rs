@@ -4642,16 +4642,18 @@ impl Perform for Grid {
             // of cell size; only *anchoring* a placement needs the cell pixel
             // size, so we gate just that step (mirroring the sixel `hook`).
             crate::panes::kitty::KittyOutcome::Store(cmd) => {
-                // The app may request a target cell footprint via `c=`/`r=`
-                // (columns/rows). When present, the image is anchored — and later
-                // emitted to the outer terminal — scaled into that many cells,
-                // rather than at native pixel size. Capture it before `feed_chunk`
-                // consumes the command.
-                let target_cols = cmd.control.target_cols;
-                let target_rows = cmd.control.target_rows;
+                // `feed_chunk` reassembles multi-chunk uploads and captures the
+                // target cell footprint (`c=`/`r=`) from the command that
+                // *finalizes* the upload — for a multi-chunk `a=T` the keys live
+                // on the first chunk, whose control is retained by
+                // `PendingUpload`, not on the final `m=0` chunk. Reading them
+                // from the `PlacementRequest` keeps scaled multi-chunk images
+                // from anchoring at native pixel size.
                 if let Some(request) = self.kitty_grid.feed_chunk(cmd) {
                     if let Some((x_px, y_px)) = self.current_cursor_pixel_coordinates() {
                         if let Some((w, h)) = self.kitty_grid.image_dimensions(request.image_id) {
+                            let target_cols = request.target_cols;
+                            let target_rows = request.target_rows;
                             // Display footprint in pixels. With `c=`/`r=`, scale
                             // the native image into that cell box (preserving
                             // aspect only as far as the app asked); otherwise use

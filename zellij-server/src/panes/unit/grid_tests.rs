@@ -6355,6 +6355,43 @@ fn kitty_cell_target_scales_footprint_and_reserves_matching_rows() {
 }
 
 #[test]
+fn kitty_scaled_multichunk_carries_cell_target_from_first_chunk() {
+    // Multi-chunk `a=T`: the `c=`/`r=` keys appear on the first chunk (whose
+    // control is retained by `PendingUpload`), NOT on the final `m=0` chunk.
+    // The placement must still be anchored at the scaled display footprint and
+    // the cursor advanced by the scaled height — otherwise the image anchors at
+    // native pixel size and a blank gap appears below it.
+    let mut parser = vte::Parser::new();
+    let mut grid = new_grid_for_forwarding_test(); // cell size 8x16
+    // Native 100x100 image, scaled into 4 cols x 3 rows, sent over two chunks.
+    // First chunk carries c=/r= with m=1; final chunk carries neither.
+    for byte in b"\x1b_Ga=T,f=32,s=100,v=100,c=4,r=3,i=7,m=1;AA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    for byte in b"\x1b_Gm=0;AA\x1b\\" {
+        parser.advance(&mut grid, *byte);
+    }
+    let placements = grid.kitty_grid.placements();
+    assert_eq!(placements.len(), 1, "one placement anchored after multi-chunk");
+    let p = &placements[0];
+    assert!(p.scaled, "placement marked scaled from first chunk's c=/r=");
+    // Display footprint: 4*8 = 32px wide, 3*16 = 48px tall (NOT native 100x100).
+    assert_eq!(p.rect.width, 32, "display width = cols * cell_w");
+    assert_eq!(p.rect.height, 48, "display height = rows * cell_h");
+    // Cursor advanced by the display height in whole cells (48/16 = 3 rows).
+    assert_eq!(
+        grid.cursor_coordinates().map(|(_, y, _)| y),
+        Some(3),
+        "cursor advanced past the scaled footprint, not native height"
+    );
+    let chunks = grid.visible_kitty_image_chunks(0, 0);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].disp_width, 32);
+    assert_eq!(chunks[0].disp_height, 48);
+    assert!(chunks[0].scaled);
+}
+
+#[test]
 fn kitty_placements_survive_a_clean_render() {
     // Bug #2: Kitty images persist in the outer terminal and are reconciled
     // against whatever each frame re-emits. The normal render path is gated on

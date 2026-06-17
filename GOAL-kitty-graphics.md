@@ -275,7 +275,10 @@ surfaced two render bugs, both now fixed and unit-tested:
    smaller than the reserved block, leaving a gap. Fix threads `c`/`r` through
    parse → anchor → chunk geometry → emit:
    - `kitty.rs`: `KittyControl.target_cols/target_rows` parsed; `KittyPlacement.scaled`;
-     `KittyChunkSpec.target_cols/target_rows` emitted as `c`/`r` on the outer `a=p`.
+     `KittyChunkSpec.target_cols/target_rows` emitted as `c`/`r` on the outer `a=p`;
+     `PlacementRequest.target_cols/target_rows` carry the footprint through
+     multi-chunk `a=T` uploads (keys on the first chunk, retained by
+     `PendingUpload`).
    - `grid.rs apc_dispatch`: anchors the placement at the *display* footprint
      (`cols*cell_w × rows*cell_h`) and advances the cursor by that height.
    - `output/mod.rs`: chunks carry `disp_width/disp_height/scaled`; the crop is
@@ -284,7 +287,9 @@ surfaced two render bugs, both now fixed and unit-tested:
    - Tests: `parses_cell_target_columns_and_rows`, `render_emits_cell_target_when_scaled`,
      `render_omits_cell_target_when_unscaled`, `kitty_scaled_chunk_emits_cell_target_and_source_crop`,
      `kitty_scaled_chunk_partial_scroll_maps_crop_to_source`,
-     `kitty_cell_target_scales_footprint_and_reserves_matching_rows`.
+     `kitty_cell_target_scales_footprint_and_reserves_matching_rows`,
+     `kitty_scaled_multichunk_carries_cell_target_from_first_chunk`,
+     `feed_multichunk_scaled_carries_cell_target_from_first_chunk`.
 
 2. **Image vanished on focus change, returned on scroll (placement reaped on
    clean frames).** Kitty placement emission was gated behind `should_render`;
