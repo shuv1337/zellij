@@ -1553,6 +1553,36 @@ impl Grid {
             changed_kitty_image_chunks,
         )
     }
+    /// Recompute the currently-visible Kitty placements *without* consuming the
+    /// output buffer or producing character chunks.
+    ///
+    /// Kitty images persist in the outer terminal and are reconciled per frame
+    /// against whatever each serialized frame re-emits (see
+    /// `KittyRenderState::reconcile_placements`). The normal render path is
+    /// gated on `should_render`, so a *clean* pane contributes no placements and
+    /// the reconcile step would tear the image down from the outer terminal
+    /// whenever some *other* part of the screen re-rendered (focus change,
+    /// status-bar clock, a sibling pane) — the image vanishes until the pane is
+    /// dirtied again (e.g. by scrolling). This accessor lets the caller re-emit
+    /// the persistent placements unconditionally; the per-client transmit-once
+    /// flag keeps it cheap (only `a=p` re-places go out, not the payload).
+    pub fn visible_kitty_image_chunks(
+        &self,
+        x_offset: usize,
+        y_offset: usize,
+    ) -> Vec<KittyImageChunk> {
+        match *self.character_cell_size.borrow() {
+            Some(cell_size) => self.kitty_grid.visible_kitty_chunks(
+                self.lines_above.len(),
+                self.height,
+                self.width,
+                x_offset,
+                y_offset,
+                cell_size,
+            ),
+            None => Vec::new(),
+        }
+    }
     pub fn serialize(&self, scrollback_lines_to_serialize: Option<usize>) -> Option<String> {
         match scrollback_lines_to_serialize {
             Some(scrollback_lines_to_serialize) => {
@@ -4612,20 +4642,50 @@ impl Perform for Grid {
             // of cell size; only *anchoring* a placement needs the cell pixel
             // size, so we gate just that step (mirroring the sixel `hook`).
             crate::panes::kitty::KittyOutcome::Store(cmd) => {
+                // The app may request a target cell footprint via `c=`/`r=`
+                // (columns/rows). When present, the image is anchored — and later
+                // emitted to the outer terminal — scaled into that many cells,
+                // rather than at native pixel size. Capture it before `feed_chunk`
+                // consumes the command.
+                let target_cols = cmd.control.target_cols;
+                let target_rows = cmd.control.target_rows;
                 if let Some(request) = self.kitty_grid.feed_chunk(cmd) {
                     if let Some((x_px, y_px)) = self.current_cursor_pixel_coordinates() {
                         if let Some((w, h)) = self.kitty_grid.image_dimensions(request.image_id) {
+                            // Display footprint in pixels. With `c=`/`r=`, scale
+                            // the native image into that cell box (preserving
+                            // aspect only as far as the app asked); otherwise use
+                            // the native pixel size.
+                            let scaled = target_cols.is_some() || target_rows.is_some();
+                            let (disp_w, disp_h) = if scaled {
+                                if let Some(cell_size) = *self.character_cell_size.borrow() {
+                                    let cw = target_cols
+                                        .map(|c| c as usize * cell_size.width)
+                                        .unwrap_or(w as usize);
+                                    let ch = target_rows
+                                        .map(|r| r as usize * cell_size.height)
+                                        .unwrap_or(h as usize);
+                                    (cw.max(1), ch.max(1))
+                                } else {
+                                    (w as usize, h as usize)
+                                }
+                            } else {
+                                (w as usize, h as usize)
+                            };
                             // `PixelRect::new(x, y, height, width)` — height first.
-                            let rect =
-                                crate::panes::sixel::PixelRect::new(x_px, y_px, h as usize, w as usize);
+                            let rect = crate::panes::sixel::PixelRect::new(
+                                x_px, y_px, disp_h, disp_w,
+                            );
                             self.kitty_grid.add_placement(
                                 request.image_id,
                                 request.placement_id,
                                 rect,
+                                scaled,
                             );
-                            // Advance the cursor past the image in whole cells,
-                            // exactly as `create_sixel_image` does.
-                            self.move_cursor_down_by_pixels(h as usize);
+                            // Advance the cursor past the image's display height
+                            // in whole cells, exactly as `create_sixel_image`
+                            // does (so reserved rows match what we draw).
+                            self.move_cursor_down_by_pixels(disp_h);
                             self.mark_for_rerender();
                         }
                     }

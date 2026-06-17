@@ -206,6 +206,9 @@ fn serialize_chunks(
     // outer terminal supports Kitty. `None` render-state => gate to placeholder.
     kitty_chunks: Option<&Vec<KittyImageChunk>>,
     kitty_render: Option<(&mut crate::panes::kitty::KittyRenderState, u16)>,
+    // Cell pixel size, needed to convert a `c=`/`r=`-scaled image's display-space
+    // crop into the target columns/rows emitted on the outer placement.
+    kitty_cell_size: Option<SizeInPixels>,
 ) -> Result<SerializedChunks> {
     let err_context = || "failed to serialize input chunks".to_string();
 
@@ -315,6 +318,47 @@ fn serialize_chunks(
             let image_vte = sixel_vte.get_or_insert_with(String::new);
             vte_goto_instruction(chunk.cell_x, chunk.cell_y, image_vte)
                 .with_context(err_context)?;
+            // The chunk carries its crop in *display* pixels (so the floating-pane
+            // clip geometry, shared with sixel, stays valid). For a `c=`/`r=`-
+            // scaled image, convert that display crop back to source pixels for
+            // the outer placement's `x,y,w,h`, and emit `c`/`r` so the outer
+            // terminal scales the cropped region into the same cell footprint the
+            // inner app reserved. Unscaled images pass their (display==source)
+            // crop through unchanged with no `c`/`r`.
+            let (src_x, src_y, src_width, src_height, target_cols, target_rows) = if chunk.scaled
+                && chunk.disp_width > 0
+                && chunk.disp_height > 0
+            {
+                let to_src_x = |v: usize| v * chunk.full_width / chunk.disp_width;
+                let to_src_y = |v: usize| v * chunk.full_height / chunk.disp_height;
+                let src_x = to_src_x(chunk.src_x);
+                let src_y = to_src_y(chunk.src_y);
+                // Round the cropped source extent up so no edge pixels are lost.
+                let src_width = (to_src_x(chunk.src_x + chunk.src_width).saturating_sub(src_x))
+                    .max(1)
+                    .min(chunk.full_width.saturating_sub(src_x).max(1));
+                let src_height = (to_src_y(chunk.src_y + chunk.src_height).saturating_sub(src_y))
+                    .max(1)
+                    .min(chunk.full_height.saturating_sub(src_y).max(1));
+                // Destination cell footprint of the visible (display) region.
+                let (cols, rows) = match kitty_cell_size {
+                    Some(cell) if cell.width > 0 && cell.height > 0 => (
+                        Some((chunk.src_width as f64 / cell.width as f64).ceil() as u32),
+                        Some((chunk.src_height as f64 / cell.height as f64).ceil() as u32),
+                    ),
+                    _ => (None, None),
+                };
+                (src_x, src_y, src_width, src_height, cols, rows)
+            } else {
+                (
+                    chunk.src_x,
+                    chunk.src_y,
+                    chunk.src_width,
+                    chunk.src_height,
+                    None,
+                    None,
+                )
+            };
             let spec = crate::panes::kitty::KittyChunkSpec {
                 source_image_id: chunk.source_image_id,
                 placement_id: chunk.placement_id,
@@ -322,10 +366,12 @@ fn serialize_chunks(
                 compressed: chunk.compressed,
                 full_width: chunk.full_width,
                 full_height: chunk.full_height,
-                src_x: chunk.src_x,
-                src_y: chunk.src_y,
-                src_width: chunk.src_width,
-                src_height: chunk.src_height,
+                src_x,
+                src_y,
+                src_width,
+                src_height,
+                target_cols,
+                target_rows,
                 payload_b64: chunk.payload_b64.clone(),
             };
             let bytes = render_state.render_chunk_bytes(client_id, &spec);
@@ -705,6 +751,7 @@ impl Output {
                 None, // No size constraints for regular rendering
                 self.kitty_chunks.get(&client_id),
                 kitty_render,
+                *self.character_cell_size.borrow(),
             )
             .with_context(err_context)?;
             client_serialized_render_instructions.push_str(&serialized.vte_output); // TODO: less allocations?
@@ -812,6 +859,7 @@ impl Output {
                 max_size,
                 self.kitty_chunks.get(&client_id),
                 kitty_render,
+                *self.character_cell_size.borrow(),
             )
             .with_context(err_context)?;
             client_serialized_render_instructions.push_str(&serialized.vte_output);
@@ -1016,6 +1064,12 @@ impl FloatingPanesStack {
                     compressed: original.compressed,
                     full_width: original.full_width,
                     full_height: original.full_height,
+                    // Display footprint and scaled flag are properties of the
+                    // whole placement; clipping only narrows the crop, which is
+                    // expressed in the same display space the clip operates in.
+                    disp_width: original.disp_width,
+                    disp_height: original.disp_height,
+                    scaled: original.scaled,
                     src_x: part.sixel_image_pixel_x,
                     src_y: part.sixel_image_pixel_y,
                     src_width: part.sixel_image_pixel_width,
@@ -1312,10 +1366,23 @@ pub struct KittyImageChunk {
     /// Kitty `f=` format (24/32/100) and `o=z` compression flag.
     pub format: u32,
     pub compressed: bool,
-    /// Full source image pixel dims (for the one-time transmit of raw formats).
+    /// Full source image pixel dims (for the one-time transmit of raw formats
+    /// and for converting a display-space crop back to source pixels).
     pub full_width: usize,
     pub full_height: usize,
-    /// Source crop (px) within the image — handles partial scroll / clipping.
+    /// Full *display* footprint of the placement in pixels. Equals
+    /// `full_width`/`full_height` for an unscaled image; for a `c=`/`r=`-scaled
+    /// image it is `cols * cell_w` / `rows * cell_h`. The crop fields below are
+    /// expressed in this display space so the floating-pane clip geometry (which
+    /// works in display pixels, shared with sixel) stays valid; the conversion
+    /// back to source pixels + `c`/`r` happens once at emit.
+    pub disp_width: usize,
+    pub disp_height: usize,
+    /// Whether the app requested cell-target scaling (`c=`/`r=`). When false the
+    /// image is emitted at native pixel size with no `c`/`r` (legacy behavior).
+    pub scaled: bool,
+    /// Visible crop within the placement, in *display* pixels (top-left origin).
+    /// Handles partial scroll / viewport / floating-pane clipping.
     pub src_x: usize,
     pub src_y: usize,
     pub src_width: usize,

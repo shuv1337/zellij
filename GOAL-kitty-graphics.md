@@ -264,6 +264,46 @@ survives partial scroll/coverage; unsupported clients get the placeholder.
 
 ---
 
+## Hardware-verification fixes (Ghostty + this fork, 2026-06)
+
+First real-terminal run (pi reading a PNG, inside this fork, inside Ghostty)
+surfaced two render bugs, both now fixed and unit-tested:
+
+1. **Blank gap below the image (cell-target scaling ignored).** The parser
+   dropped the `c=`/`r=` (target columns/rows) keys, so an image pi reserved N
+   rows for was anchored and emitted at native pixel size — Ghostty drew it
+   smaller than the reserved block, leaving a gap. Fix threads `c`/`r` through
+   parse → anchor → chunk geometry → emit:
+   - `kitty.rs`: `KittyControl.target_cols/target_rows` parsed; `KittyPlacement.scaled`;
+     `KittyChunkSpec.target_cols/target_rows` emitted as `c`/`r` on the outer `a=p`.
+   - `grid.rs apc_dispatch`: anchors the placement at the *display* footprint
+     (`cols*cell_w × rows*cell_h`) and advances the cursor by that height.
+   - `output/mod.rs`: chunks carry `disp_width/disp_height/scaled`; the crop is
+     kept in display pixels (so the floating-pane clip geometry stays valid) and
+     converted back to source pixels + `c`/`r` once at emit.
+   - Tests: `parses_cell_target_columns_and_rows`, `render_emits_cell_target_when_scaled`,
+     `render_omits_cell_target_when_unscaled`, `kitty_scaled_chunk_emits_cell_target_and_source_crop`,
+     `kitty_scaled_chunk_partial_scroll_maps_crop_to_source`,
+     `kitty_cell_target_scales_footprint_and_reserves_matching_rows`.
+
+2. **Image vanished on focus change, returned on scroll (placement reaped on
+   clean frames).** Kitty placement emission was gated behind `should_render`;
+   when an unrelated part of the screen re-rendered, the image's (clean) pane
+   contributed no chunks, so `reconcile_placements` saw the placement as gone and
+   deleted it from the outer terminal. Scrolling re-dirtied the pane and brought
+   it back. Fix decouples placement emission from `should_render`:
+   - `grid.rs`: `visible_kitty_image_chunks()` re-derives live placements without
+     consuming the output buffer.
+   - `terminal_pane.rs render`: a clean pane now re-emits persistent Kitty
+     placements (empty character/sixel chunks → no text moves); the per-client
+     transmit-once flag keeps it to cheap `a=p` re-places.
+   - Tests: `kitty_placements_survive_a_clean_render`.
+
+Full `zellij-server` lib suite green (1230); release binary builds via
+`cargo xtask build --release`.
+
+---
+
 ## Status: IMPLEMENTATION COMPLETE (pending hardware verification)
 
 All phases (0 → 4) are implemented and unit-tested across **10 commits**; the full

@@ -124,6 +124,9 @@ fn kitty_chunks_emitted_only_to_supporting_clients() {
         compressed: false,
         full_width: 10,
         full_height: 10,
+        disp_width: 10,
+        disp_height: 10,
+        scaled: false,
         src_x: 0,
         src_y: 0,
         src_width: 10,
@@ -144,6 +147,91 @@ fn kitty_chunks_emitted_only_to_supporting_clients() {
     );
 }
 
+#[test]
+fn kitty_scaled_chunk_emits_cell_target_and_source_crop() {
+    // A `c=`/`r=`-scaled placement carries its crop in *display* pixels; the
+    // outer placement must convert that crop back to source pixels and emit
+    // `c`/`r` so the outer terminal scales the image into the reserved cells.
+    use crate::output::KittyImageChunk;
+    let mut output = create_test_output(); // cell size 10x20
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+
+    // Native image 100x100; scaled into a 40x40px display footprint (4 cols x
+    // 2 rows at 10x20px cells). Fully visible: display crop == display footprint.
+    let chunk = KittyImageChunk {
+        cell_x: 0,
+        cell_y: 0,
+        source_image_id: 9,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 100,
+        full_height: 100,
+        disp_width: 40,
+        disp_height: 40,
+        scaled: true,
+        src_x: 0,
+        src_y: 0,
+        src_width: 40,
+        src_height: 40,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    output.add_kitty_image_chunks_to_multiple_clients(vec![chunk], client_ids.iter().copied(), None);
+    let c1 = output.serialize().unwrap().get(&1).cloned().unwrap_or_default();
+
+    // Full source region transmitted (crop maps 0..40 display -> 0..100 source).
+    assert!(c1.contains("w=100,h=100"), "full source crop: {:?}", c1);
+    // Target footprint: 40/10 = 4 cols, 40/20 = 2 rows.
+    assert!(c1.contains(",c=4"), "target cols from display footprint: {:?}", c1);
+    assert!(c1.contains(",r=2"), "target rows from display footprint: {:?}", c1);
+}
+
+#[test]
+fn kitty_scaled_chunk_partial_scroll_maps_crop_to_source() {
+    // Half the scaled image scrolled off the top: the display crop starts at
+    // src_y=20 (half of the 40px footprint), which must map to source y=50.
+    use crate::output::KittyImageChunk;
+    let mut output = create_test_output(); // cell size 10x20
+    let client_ids = create_test_clients(1);
+    let link_handler = Rc::new(RefCell::new(LinkHandler::new()));
+    output.add_clients(&client_ids, link_handler, None);
+    let mut support = std::collections::HashMap::new();
+    support.insert(1, true);
+    output.set_outer_kitty_support(support);
+
+    let chunk = KittyImageChunk {
+        cell_x: 0,
+        cell_y: 0,
+        source_image_id: 9,
+        placement_id: 1,
+        format: 100,
+        compressed: false,
+        full_width: 100,
+        full_height: 100,
+        disp_width: 40,
+        disp_height: 40,
+        scaled: true,
+        src_x: 0,
+        src_y: 20, // bottom half visible (display px)
+        src_width: 40,
+        src_height: 20,
+        payload_b64: b"AAAA".to_vec(),
+    };
+    output.add_kitty_image_chunks_to_multiple_clients(vec![chunk], client_ids.iter().copied(), None);
+    let c1 = output.serialize().unwrap().get(&1).cloned().unwrap_or_default();
+
+    // Display crop y=20,h=20 over a 40px footprint -> source y=50,h=50.
+    assert!(c1.contains("y=50"), "crop y mapped to source px: {:?}", c1);
+    assert!(c1.contains("h=50"), "crop h mapped to source px: {:?}", c1);
+    // Visible region is 20px tall -> 1 row at 20px cells.
+    assert!(c1.contains(",r=1"), "visible rows: {:?}", c1);
+}
+
 fn make_kitty_chunk(cell_x: usize, cell_y: usize, w: usize, h: usize) -> crate::output::KittyImageChunk {
     crate::output::KittyImageChunk {
         cell_x,
@@ -154,6 +242,9 @@ fn make_kitty_chunk(cell_x: usize, cell_y: usize, w: usize, h: usize) -> crate::
         compressed: false,
         full_width: w,
         full_height: h,
+        disp_width: w,
+        disp_height: h,
+        scaled: false,
         src_x: 0,
         src_y: 0,
         src_width: w,
@@ -234,6 +325,9 @@ fn kitty_deletion_emits_delete_to_supporting_client() {
         compressed: false,
         full_width: 4,
         full_height: 4,
+        disp_width: 4,
+        disp_height: 4,
+        scaled: false,
         src_x: 0,
         src_y: 0,
         src_width: 4,
@@ -289,6 +383,9 @@ fn kitty_placement_cropped_by_watcher_size_is_reconciled_stale() {
         compressed: false,
         full_width: 4,
         full_height: 4,
+        disp_width: 4,
+        disp_height: 4,
+        scaled: false,
         src_x: 0,
         src_y: 0,
         src_width: 4,

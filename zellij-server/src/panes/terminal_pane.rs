@@ -362,14 +362,14 @@ impl Pane for TerminalPane {
             Vec<KittyImageChunk>,
         )>,
     > {
+        let content_x = self.get_content_x();
+        let content_y = self.get_content_y();
+        let rows = self.get_content_rows();
+        let columns = self.get_content_columns();
+        if rows < 1 || columns < 1 {
+            return Ok(None);
+        }
         if self.should_render() {
-            let content_x = self.get_content_x();
-            let content_y = self.get_content_y();
-            let rows = self.get_content_rows();
-            let columns = self.get_content_columns();
-            if rows < 1 || columns < 1 {
-                return Ok(None);
-            }
             match self.grid.render(content_x, content_y, &self.style) {
                 Ok(rendered_assets) => {
                     self.set_should_render(false);
@@ -378,7 +378,20 @@ impl Pane for TerminalPane {
                 e => return e,
             }
         } else {
-            Ok(None)
+            // The pane is not dirty, so no text needs redrawing. Kitty images,
+            // however, persist in the outer terminal and are reconciled against
+            // what every serialized frame re-emits. If we contributed nothing
+            // here, the reconcile step would delete a visible image whenever any
+            // *other* part of the screen re-rendered (focus change, status
+            // clock, a sibling pane). Re-emit the persistent placements so they
+            // stay alive; character/sixel chunks stay empty so no text moves.
+            // The per-client transmit-once flag keeps this cheap (only `a=p`
+            // re-places go out, not the image payload).
+            let kitty_image_chunks = self.grid.visible_kitty_image_chunks(content_x, content_y);
+            if kitty_image_chunks.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some((vec![], None, vec![], kitty_image_chunks)))
         }
     }
     fn drain_kitty_deletions(&mut self) -> Vec<u32> {
